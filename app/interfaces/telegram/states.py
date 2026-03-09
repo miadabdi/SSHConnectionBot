@@ -9,3 +9,4 @@ class ConnectForm(StatesGroup):
     auth_type = State()
     password = State()
     key_file = State()
+    key_passphrase = State()

@@ -1,4 +1,5 @@
 import logging
+from base64 import b64decode, b64encode
 from io import BytesIO
 
 from aiogram import Bot, Router
@@ -34,6 +35,7 @@ class ConnectHandler:
         self.router.callback_query.register(self.cb_auth_type, lambda c: c.data and c.data.startswith("auth:"))
         self.router.message.register(self.process_password, StateFilter(ConnectForm.password))
         self.router.message.register(self.process_key_file, StateFilter(ConnectForm.key_file))
+        self.router.message.register(self.process_key_passphrase, StateFilter(ConnectForm.key_passphrase))
 
     async def cmd_connect(self, message: Message, state: FSMContext) -> None:
         await state.set_state(ConnectForm.name)
@@ -133,7 +135,39 @@ class ConnectHandler:
             await message.answer(f"❌ Failed to read key file: {exc}")
             return
 
-        await self._do_connect(message=message, state=state, key_data=key_data)
+        await state.update_data(key_data_b64=b64encode(key_data).decode())
+        await state.set_state(ConnectForm.key_passphrase)
+        await message.answer("🔐 Enter key passphrase, or send <code>-</code> if the key has no passphrase.")
+
+    async def process_key_passphrase(self, message: Message, state: FSMContext) -> None:
+        if message.text is None:
+            await message.answer("❌ Enter the passphrase as text, or send <code>-</code> to skip.")
+            return
+
+        passphrase_text = message.text
+        passphrase = None if passphrase_text.strip() == "-" else passphrase_text
+
+        data = await state.get_data()
+        encoded_key = data.get("key_data_b64")
+        if not isinstance(encoded_key, str):
+            await state.clear()
+            await message.answer("❌ Key upload expired. Please run <code>/connect</code> again.")
+            return
+
+        try:
+            key_data = b64decode(encoded_key.encode())
+        except Exception:
+            await state.clear()
+            await message.answer("❌ Invalid key data. Please run <code>/connect</code> again.")
+            return
+
+        if passphrase is not None:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+        await self._do_connect(message=message, state=state, password=passphrase, key_data=key_data)
 
     async def _do_connect(
         self,
@@ -172,6 +206,10 @@ class ConnectHandler:
             error_message = str(exc)
             if "Permission denied" in error_message or "Authentication" in error_message:
                 rendered = "Authentication failed. Check your credentials."
+            elif "Passphrase must be specified" in error_message:
+                rendered = "This private key requires a passphrase."
+            elif "Incorrect passphrase" in error_message:
+                rendered = "Incorrect key passphrase."
             elif "timed out" in error_message or "Timeout" in error_message:
                 rendered = "Connection timed out. Check host and port."
             elif "refused" in error_message:

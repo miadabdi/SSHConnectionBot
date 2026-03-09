@@ -59,11 +59,11 @@ class AsyncSSHSession:
 
         if key_data:
             self.auth_type = "key"
-            imported_key = asyncssh.import_private_key(key_data.decode())
+            imported_key = asyncssh.import_private_key(key_data.decode(), passphrase=password)
             connect_kwargs["client_keys"] = [imported_key]
             connect_kwargs["password"] = None
             self.key_cache = key_data
-            self.password_cache = ""
+            self.password_cache = password or ""
         else:
             self.auth_type = "password"
             connect_kwargs["password"] = password
