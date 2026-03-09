@@ -210,6 +210,8 @@ class ConnectHandler:
                 rendered = "This private key requires a passphrase."
             elif "Incorrect passphrase" in error_message:
                 rendered = "Incorrect key passphrase."
+            elif "requires bcrypt with KDF support" in error_message:
+                rendered = "Encrypted OpenSSH key requires bcrypt support in the bot runtime."
             elif "timed out" in error_message or "Timeout" in error_message:
                 rendered = "Connection timed out. Check host and port."
             elif "refused" in error_message:
