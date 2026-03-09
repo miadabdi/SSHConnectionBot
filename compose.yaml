@@ -1,0 +1,37 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: sshbot_v2_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-adminpassword}
+      MONGO_DB_NAME: ${MONGO_DB_NAME:-ssh_bot}
+      MONGO_USER: ${MONGO_USER:-ssh_bot_user}
+      MONGO_PASSWORD: ${MONGO_PASSWORD:-ssh_bot_password}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+      - ./docker/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "mongodb://$$MONGO_INITDB_ROOT_USERNAME:$$MONGO_INITDB_ROOT_PASSWORD@localhost:27017/admin", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sshbot_v2_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      mongo:
+        condition: service_healthy
+    command: ["python", "-m", "app.main"]
+
+volumes:
+  mongo_data:
