@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import shlex
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 
 import asyncssh
@@ -20,12 +22,18 @@ class AsyncSSHSession:
         self.port = 22
         self.username = ""
         self.auth_type: str = "password"
+        self.default_cwd: str = ""
 
         self._last_activity = time.monotonic()
         self._shell_process: asyncssh.SSHClientProcess | None = None
         self._shell_reader_task: asyncio.Task | None = None
         self._shell_callback: OutputCallback | None = None
         self.is_interactive = False
+        self._probe_lock = asyncio.Lock()
+        self._probe_begin_marker: str | None = None
+        self._probe_end_marker: str | None = None
+        self._probe_buffer: str = ""
+        self._probe_future: asyncio.Future[str] | None = None
 
         self.password_cache: str = ""
         self.key_cache: bytes = b""
@@ -45,10 +53,12 @@ class AsyncSSHSession:
         username: str,
         password: str | None = None,
         key_data: bytes | None = None,
+        default_cwd: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.username = username
+        self.default_cwd = (default_cwd or "").strip()
 
         connect_kwargs: dict = {
             "host": host,
@@ -78,8 +88,16 @@ class AsyncSSHSession:
         if not self.conn:
             raise RuntimeError("Not connected")
 
+        prepared_command = command
+        if self.default_cwd:
+            prepared_command = f"cd {shlex.quote(self.default_cwd)} && {command}"
+
         self._last_activity = time.monotonic()
-        process = await self.conn.create_process(command, term_type="xterm", term_size=(200, 50))
+        process = await self.conn.create_process(
+            prepared_command,
+            term_type="xterm",
+            term_size=(200, 50),
+        )
 
         async def read_stream(stream: asyncssh.SSHReader) -> None:
             while True:
@@ -113,6 +131,8 @@ class AsyncSSHSession:
 
         self._shell_callback = on_output_chunk
         self._shell_process = await self.conn.create_process(term_type="xterm", term_size=(200, 50))
+        if self.default_cwd:
+            self._shell_process.stdin.write(f"cd {shlex.quote(self.default_cwd)}\n")
         self.is_interactive = True
         self._last_activity = time.monotonic()
         self._shell_reader_task = asyncio.create_task(self._read_shell_loop())
@@ -128,6 +148,10 @@ class AsyncSSHSession:
                     if not chunk:
                         break
                     self._last_activity = time.monotonic()
+                    if self._probe_future:
+                        self._probe_buffer += chunk
+                        self._try_finish_probe()
+                        continue
                     await self._shell_callback(chunk)
                 except asyncio.TimeoutError:
                     continue
@@ -135,6 +159,68 @@ class AsyncSSHSession:
                     break
         except asyncio.CancelledError:
             pass
+
+    def _try_finish_probe(self) -> None:
+        if (
+            not self._probe_future
+            or not self._probe_begin_marker
+            or not self._probe_end_marker
+            or self._probe_future.done()
+        ):
+            return
+
+        lines = [line.strip() for line in self._probe_buffer.replace("\r", "\n").split("\n")]
+
+        try:
+            begin_idx = next(index for index, line in enumerate(lines) if line == self._probe_begin_marker)
+            end_idx = next(
+                index
+                for index, line in enumerate(lines[begin_idx + 1 :], start=begin_idx + 1)
+                if line == self._probe_end_marker
+            )
+        except StopIteration:
+            return
+
+        cwd_line = ""
+        for line in lines[begin_idx + 1 : end_idx]:
+            if line:
+                cwd_line = line
+                break
+
+        if cwd_line:
+            self._probe_future.set_result(cwd_line)
+        else:
+            self._probe_future.set_exception(RuntimeError("Could not determine shell working directory"))
+
+    async def get_shell_cwd(self) -> str:
+        if not self._shell_process or not self.is_interactive:
+            raise RuntimeError("No interactive shell active")
+
+        async with self._probe_lock:
+            if self._probe_future and not self._probe_future.done():
+                raise RuntimeError("Shell probe already in progress")
+
+            probe_id = uuid.uuid4().hex
+            self._probe_begin_marker = f"__SSHBOT_PWD_BEGIN_{probe_id}__"
+            self._probe_end_marker = f"__SSHBOT_PWD_END_{probe_id}__"
+            self._probe_buffer = ""
+            self._probe_future = asyncio.get_running_loop().create_future()
+
+            self._shell_process.stdin.write(
+                f"echo {self._probe_begin_marker}; pwd; echo {self._probe_end_marker}\n"
+            )
+
+            try:
+                cwd = await asyncio.wait_for(self._probe_future, timeout=4.0)
+                self._last_activity = time.monotonic()
+                return cwd
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Timed out while resolving shell working directory") from exc
+            finally:
+                self._probe_begin_marker = None
+                self._probe_end_marker = None
+                self._probe_buffer = ""
+                self._probe_future = None
 
     async def send_to_shell(self, text: str) -> None:
         if not self._shell_process or not self.is_interactive:
@@ -144,6 +230,13 @@ class AsyncSSHSession:
 
     async def close_shell(self) -> None:
         self.is_interactive = False
+
+        if self._probe_future and not self._probe_future.done():
+            self._probe_future.set_exception(RuntimeError("Interactive shell closed"))
+        self._probe_begin_marker = None
+        self._probe_end_marker = None
+        self._probe_buffer = ""
+        self._probe_future = None
 
         if self._shell_reader_task:
             self._shell_reader_task.cancel()

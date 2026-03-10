@@ -194,6 +194,15 @@ class SessionHandler:
         if not text:
             return
 
+        if text.startswith("//"):
+            text = text[1:]
+        elif text.startswith("/"):
+            await message.answer(
+                "ℹ️ Commands starting with <code>/</code> are reserved for bot commands.\n"
+                "To run a remote slash command, prefix it with <code>//</code>."
+            )
+            return
+
         if session.is_interactive:
             try:
                 await self.service.shell_input(user_id=user_id, text=text)

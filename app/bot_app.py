@@ -71,7 +71,11 @@ class BotApp:
 
     def _register_handlers(self) -> None:
         start_handler = StartHandler()
-        connect_handler = ConnectHandler(service=self.connection_service)
+        connect_handler = ConnectHandler(
+            service=self.connection_service,
+            stream_publisher=self.stream_publisher,
+            stream_update_interval=settings.stream_update_interval,
+        )
         session_handler = SessionHandler(
             service=self.command_service,
             stream_publisher=self.stream_publisher,

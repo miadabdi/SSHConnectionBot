@@ -21,9 +21,9 @@ class SavedServerHandler:
         self.router.message.register(self.cmd_delserver, Command("delserver"))
 
     async def cmd_save(self, message: Message) -> None:
-        args = (message.text or "").split(maxsplit=1)
+        args = (message.text or "").split(maxsplit=2)
         if len(args) < 2:
-            await message.answer("❌ Usage: <code>/save &lt;name&gt;</code>")
+            await message.answer("❌ Usage: <code>/save &lt;name&gt; [default_cwd]</code>")
             return
 
         name = args[1].strip().lower()
@@ -31,17 +31,28 @@ class SavedServerHandler:
             await message.answer("❌ Invalid server name.")
             return
 
+        default_cwd = args[2].strip() if len(args) > 2 else None
+        if default_cwd == "-":
+            default_cwd = ""
+
         try:
-            server = await self.service.save_current_as(user_id=message.from_user.id, name=name)
+            server = await self.service.save_current_as(
+                user_id=message.from_user.id,
+                name=name,
+                default_cwd=default_cwd,
+            )
         except SessionUnavailableError:
             await message.answer("ℹ️ No active SSH session to save.")
             return
 
-        await message.answer(
+        lines = [
             f"💾 Server saved as <code>{server.name}</code>\n"
-            f"🖥 {server.host}:{server.port}\n"
-            f"Use <code>/quick {server.name}</code> to connect instantly."
-        )
+            f"🖥 {server.host}:{server.port}",
+        ]
+        if server.default_cwd:
+            lines.append(f"📁 Default dir: <code>{server.default_cwd}</code>")
+        lines.append(f"Use <code>/connect {server.name}</code> to reconnect and open a shell.")
+        await message.answer("\n".join(lines))
 
     async def cmd_quick(self, message: Message) -> None:
         args = (message.text or "").split(maxsplit=1)
@@ -67,7 +78,8 @@ class SavedServerHandler:
         await status.edit_text(
             f"✅ <b>Connected</b> (session: <code>{session.name}</code>)\n\n"
             f"🖥 Host: <code>{session.host}:{session.port}</code>\n"
-            f"👤 User: <code>{session.username}</code>"
+            f"👤 User: <code>{session.username}</code>\n"
+            f"Tip: use <code>/shell</code> for persistent shell mode."
         )
 
     async def cmd_servers(self, message: Message) -> None:
@@ -87,8 +99,10 @@ class SavedServerHandler:
                 lines.append(f"\n📁 <b>{group}</b>")
             for item in items:
                 auth_icon = "🔑" if item.auth_type == "key" else "🔐"
+                cwd_suffix = f" | cwd: {item.default_cwd}" if item.default_cwd else ""
                 lines.append(
-                    f"  {auth_icon} <code>{item.name}</code> — {item.host}:{item.port} as {item.username}"
+                    f"  {auth_icon} <code>{item.name}</code> — "
+                    f"{item.host}:{item.port} as {item.username}{cwd_suffix}"
                 )
 
         await message.answer("\n".join(lines))

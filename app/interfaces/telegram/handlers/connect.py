@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import time
 from base64 import b64decode, b64encode
 from io import BytesIO
 
@@ -9,15 +11,24 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from app.application.services import ConnectionService
 from app.domain.errors import NotFoundError, ValidationError
+from app.domain.ports import StreamPublisher
 from app.interfaces.telegram.states import ConnectForm
+from app.utils.formatting import Formatter
 from app.utils.validators import is_valid_host, is_valid_port, is_valid_slug
 
 logger = logging.getLogger(__name__)
 
 
 class ConnectHandler:
-    def __init__(self, service: ConnectionService) -> None:
+    def __init__(
+        self,
+        service: ConnectionService,
+        stream_publisher: StreamPublisher,
+        stream_update_interval: float,
+    ) -> None:
         self.service = service
+        self.stream = stream_publisher
+        self.stream_update_interval = stream_update_interval
         self.router = Router(name="connect")
         self._register()
 
@@ -26,6 +37,7 @@ class ConnectHandler:
         self.router.message.register(self.cmd_disconnect, Command("disconnect"))
         self.router.message.register(self.cmd_switch, Command("switch"))
         self.router.message.register(self.cmd_status, Command("status"))
+        self.router.message.register(self.cmd_sessions, Command("sessions"))
         self.router.message.register(self.cmd_history, Command("history"))
 
         self.router.message.register(self.process_name, StateFilter(ConnectForm.name))
@@ -38,11 +50,98 @@ class ConnectHandler:
         self.router.message.register(self.process_key_passphrase, StateFilter(ConnectForm.key_passphrase))
 
     async def cmd_connect(self, message: Message, state: FSMContext) -> None:
+        args = (message.text or "").split(maxsplit=1)
+        if len(args) > 1:
+            saved_name = args[1].strip().lower()
+            if not is_valid_slug(saved_name):
+                await message.answer("❌ Invalid saved server name.")
+                return
+            await state.clear()
+            await self._connect_saved(message=message, saved_name=saved_name)
+            return
+
         await state.set_state(ConnectForm.name)
         await message.answer(
             "🌐 <b>New SSH Connection</b>\n\n"
             "Enter a session name (e.g. <code>prod</code>, <code>staging</code>):"
         )
+
+    async def _connect_saved(self, message: Message, saved_name: str) -> None:
+        status = await message.answer(f"⏳ Connecting to saved server <code>{saved_name}</code>...")
+
+        try:
+            session = await self.service.quick_connect(user_id=message.from_user.id, name=saved_name)
+        except ValidationError as exc:
+            await status.edit_text(f"❌ {exc}")
+            return
+        except NotFoundError:
+            await status.edit_text(f"❌ Saved server <code>{saved_name}</code> not found.")
+            return
+        except Exception as exc:
+            await status.edit_text(f"❌ Connect failed: {exc}")
+            return
+
+        shell_error: str | None = None
+        try:
+            await self._open_shell(message=message, session_name=session.name)
+        except Exception as exc:
+            shell_error = str(exc)
+
+        active_count = len(self.service.sessions.get_all(message.from_user.id))
+        lines = [
+            f"✅ <b>Connected</b> (session: <code>{session.name}</code>)",
+            "",
+            f"🖥 Host: <code>{session.host}:{session.port}</code>",
+            f"👤 User: <code>{session.username}</code>",
+            f"🔐 Auth: {session.auth_type}",
+            f"📊 Active sessions: {active_count}",
+        ]
+        default_cwd = getattr(session, "default_cwd", "")
+        if default_cwd:
+            lines.append(f"📁 Default dir: <code>{Formatter.escape_html(default_cwd)}</code>")
+
+        if shell_error:
+            lines.append("")
+            lines.append(f"⚠️ Connected, but failed to open interactive shell: {Formatter.escape_html(shell_error)}")
+            lines.append("Use <code>/shell</code> to retry interactive mode.")
+        else:
+            lines.append("")
+            lines.append("🔁 Interactive shell is active. Send commands directly.")
+            lines.append("Use <code>/switch &lt;session&gt;</code> to resume other sessions.")
+
+        await status.edit_text("\n".join(lines))
+
+    async def _open_shell(self, message: Message, session_name: str) -> None:
+        session = self.service.sessions.get(message.from_user.id, session_name)
+        if not session:
+            raise RuntimeError("Session not available")
+        if session.is_interactive:
+            return
+
+        stream_id = self.stream.generate_stream_id()
+        shell_buffer = ""
+        lock = asyncio.Lock()
+        last_publish = 0.0
+
+        async def on_shell_chunk(chunk: str) -> None:
+            nonlocal shell_buffer, last_publish
+            async with lock:
+                shell_buffer += chunk
+                now = time.monotonic()
+                if now - last_publish < self.stream_update_interval:
+                    return
+                last_publish = now
+
+                trimmed = shell_buffer[-3500:] if len(shell_buffer) > 3500 else shell_buffer
+                rendered = Formatter.format_bash(trimmed)
+                await self.stream.publish(
+                    chat_id=message.chat.id,
+                    stream_id=stream_id,
+                    text=rendered,
+                    parse_mode="HTML",
+                )
+
+        await session.open_shell(on_shell_chunk)
 
     async def process_name(self, message: Message, state: FSMContext) -> None:
         name = (message.text or "").strip().lower()
@@ -300,8 +399,12 @@ class ConnectHandler:
                 f"   🖥 {session.host}:{session.port} as {session.username}\n"
                 f"   🔐 {session.auth_type} | {mode}"
             )
+        lines.append("\nUse <code>/switch &lt;name&gt;</code> to resume a session.")
 
         await message.answer("\n".join(lines))
+
+    async def cmd_sessions(self, message: Message) -> None:
+        await self.cmd_status(message)
 
     async def cmd_history(self, message: Message) -> None:
         entries = await self.service.get_history(message.from_user.id)

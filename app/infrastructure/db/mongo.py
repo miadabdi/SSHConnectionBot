@@ -142,6 +142,7 @@ class MongoDatabase:
                     "encrypted_password": server.encrypted_password,
                     "encrypted_key": server.encrypted_key,
                     "group": server.group,
+                    "default_cwd": server.default_cwd,
                     "updated_at": datetime.now(timezone.utc),
                 },
                 "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
@@ -163,6 +164,7 @@ class MongoDatabase:
             group=doc.get("group", ""),
             encrypted_password=doc.get("encrypted_password", ""),
             encrypted_key=doc.get("encrypted_key", ""),
+            default_cwd=doc.get("default_cwd", ""),
         )
 
     async def list_servers(self, user_id: int) -> list[SavedServer]:
@@ -178,6 +180,7 @@ class MongoDatabase:
                 group=d.get("group", ""),
                 encrypted_password=d.get("encrypted_password", ""),
                 encrypted_key=d.get("encrypted_key", ""),
+                default_cwd=d.get("default_cwd", ""),
             )
             for d in docs
         ]
@@ -206,6 +209,7 @@ class MongoDatabase:
                 group=d.get("group", ""),
                 encrypted_password=d.get("encrypted_password", ""),
                 encrypted_key=d.get("encrypted_key", ""),
+                default_cwd=d.get("default_cwd", ""),
             )
             for d in docs
         ]

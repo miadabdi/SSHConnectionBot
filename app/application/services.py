@@ -1,4 +1,5 @@
 import os
+import posixpath
 import re
 import tempfile
 from dataclasses import dataclass
@@ -62,23 +63,22 @@ class ConnectionService:
         return session
 
     async def quick_connect(self, user_id: int, name: str):
-        if self.sessions.get(user_id, name):
-            raise ValidationError(f"Session '{name}' already exists")
-
         saved = await self.server_repo.get_server(user_id=user_id, name=name)
         if not saved:
             raise NotFoundError(f"Saved server '{name}' not found")
 
+        session_name = self._next_session_name(user_id=user_id, base_name=name)
         password = self.cipher.decrypt(saved.encrypted_password) if saved.encrypted_password else None
         key_data = self.cipher.decrypt(saved.encrypted_key).encode() if saved.encrypted_key else None
 
-        session = self.sessions.create_session(user_id=user_id, name=name)
+        session = self.sessions.create_session(user_id=user_id, name=session_name)
         await session.connect(
             host=saved.host,
             port=saved.port,
             username=saved.username,
             password=password,
             key_data=key_data,
+            default_cwd=saved.default_cwd or None,
         )
         self.sessions.store(user_id=user_id, session=session)
 
@@ -87,12 +87,24 @@ class ConnectionService:
             host=saved.host,
             port=saved.port,
             username=saved.username,
-            session_name=name,
+            session_name=session_name,
             auth_type=saved.auth_type,
             encrypted_password=saved.encrypted_password,
             encrypted_key=saved.encrypted_key,
         )
         return session
+
+    def _next_session_name(self, user_id: int, base_name: str) -> str:
+        active_names = set(self.sessions.get_all(user_id).keys())
+        if base_name not in active_names:
+            return base_name
+
+        index = 2
+        while True:
+            candidate = f"{base_name}-{index}"
+            if candidate not in active_names:
+                return candidate
+            index += 1
 
     async def disconnect(self, user_id: int, name: str | None = None) -> DisconnectResult:
         session = self.sessions.get(user_id, name)
@@ -218,7 +230,12 @@ class SavedServerService:
         self.history_repo = history_repo
         self.server_repo = server_repo
 
-    async def save_current_as(self, user_id: int, name: str) -> SavedServer:
+    async def save_current_as(
+        self,
+        user_id: int,
+        name: str,
+        default_cwd: str | None = None,
+    ) -> SavedServer:
         session = self.sessions.get_active(user_id)
         if not session:
             raise SessionUnavailableError("No active session")
@@ -229,6 +246,16 @@ class SavedServerService:
 
         existing = await self.server_repo.get_server(user_id=user_id, name=name)
         group_name = existing.group if existing else ""
+        resolved_cwd = (default_cwd or "").strip()
+
+        if not resolved_cwd:
+            if session.is_interactive:
+                try:
+                    resolved_cwd = (await session.get_shell_cwd()).strip()
+                except Exception:
+                    resolved_cwd = ""
+            if not resolved_cwd and existing:
+                resolved_cwd = existing.default_cwd
 
         server = SavedServer(
             user_id=user_id,
@@ -240,6 +267,7 @@ class SavedServerService:
             group=group_name,
             encrypted_password=encrypted_password,
             encrypted_key=encrypted_key,
+            default_cwd=resolved_cwd,
         )
         await self.server_repo.upsert_server(server)
         return server
@@ -322,11 +350,26 @@ class FileTransferService:
         await session.sftp_download(remote_path=remote_path, local_path=local_path)
         return temp_dir, local_path
 
-    async def upload_local_file(self, user_id: int, local_path: str, remote_path: str) -> None:
+    async def upload_local_file(
+        self,
+        user_id: int,
+        local_path: str,
+        remote_path: str | None = None,
+    ) -> str:
         session = self.sessions.get_active(user_id)
         if not session:
             raise SessionUnavailableError("No active session")
-        await session.sftp_upload(local_path=local_path, remote_path=remote_path)
+
+        target_path = remote_path
+        if not target_path:
+            if not session.is_interactive:
+                raise ValidationError("Interactive shell is required when remote path is omitted")
+            shell_cwd = await session.get_shell_cwd()
+            file_name = os.path.basename(local_path) or "upload.bin"
+            target_path = posixpath.join(shell_cwd, file_name)
+
+        await session.sftp_upload(local_path=local_path, remote_path=target_path)
+        return target_path
 
 
 class MonitorService:

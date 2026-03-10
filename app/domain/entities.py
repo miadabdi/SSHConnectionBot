@@ -41,6 +41,7 @@ class SavedServer:
     group: str
     encrypted_password: str
     encrypted_key: str
+    default_cwd: str = ""
 
 
 @dataclass(slots=True)
