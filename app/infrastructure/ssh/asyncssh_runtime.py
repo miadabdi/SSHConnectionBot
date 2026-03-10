@@ -293,6 +293,11 @@ class AsyncSSHSession:
             re.compile(r"(?i)(do you want to continue\?\s*\[y/n\]\s*)$"),
             re.compile(r"(?i)(\[[y/n/]+\]\s*)$"),
             re.compile(r"(?i)(\([y/n/]+\)\s*)$"),
+            re.compile(r"(?i)(\[question\][^\n]*:\s*)$"),
+            re.compile(r"(?i)(please select an option[^\n]*:\s*)$"),
+            re.compile(r"(?i)(select an option[^\n]*:\s*)$"),
+            re.compile(r"(?i)(enter choice[^\n]*:\s*)$"),
+            re.compile(r"(?i)(choose an option[^\n]*:\s*)$"),
         ]
         for pattern in prompt_patterns:
             match = pattern.search(text)

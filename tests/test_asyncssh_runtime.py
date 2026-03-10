@@ -256,3 +256,28 @@ async def test_reply_shell_prompt_continues_pending_command() -> None:
     assert output == "file_a"
     assert exit_code == 0
     assert cwd == "/home/ubuntu"
+
+
+@pytest.mark.asyncio
+async def test_run_shell_command_detects_question_menu_prompt() -> None:
+    session = asyncssh_runtime.AsyncSSHSession(user_id=9, name="menu")
+    session.is_interactive = True
+    session._shell_process = _FakeShellProcess()
+
+    task = asyncio.create_task(session.run_shell_command("sudo dnstt-deploy"))
+    await asyncio.sleep(0)
+
+    begin = session._command_begin_marker
+    assert begin is not None
+    session._command_buffer = (
+        f"{begin}\n"
+        "[INFO] Checking for script updates...\n"
+        "[INFO] Script is up to date\n\n"
+        "[QUESTION] Please select an option (0-5): "
+    )
+    await session._try_finish_command()
+
+    with pytest.raises(InteractiveInputRequiredError) as exc:
+        await task
+
+    assert "Please select an option (0-5)" in exc.value.prompt
