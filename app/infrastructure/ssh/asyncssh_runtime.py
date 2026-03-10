@@ -41,6 +41,7 @@ class AsyncSSHSession:
         self._command_text: str = ""
         self._command_buffer: str = ""
         self._command_future: asyncio.Future[tuple[str, int, str]] | None = None
+        self._shell_clean_mode = False
 
         self.password_cache: str = ""
         self.key_cache: bytes = b""
@@ -138,8 +139,15 @@ class AsyncSSHSession:
 
         self._shell_callback = on_output_chunk
         self._shell_process = await self.conn.create_process(term_type="xterm", term_size=(200, 50))
+        self._shell_process.stdin.write(
+            "unset PROMPT_COMMAND; "
+            "export PS1=''; "
+            "stty -echo >/dev/null 2>&1 || true; "
+            "bind 'set enable-bracketed-paste off' >/dev/null 2>&1 || true\n"
+        )
         if self.default_cwd:
-            self._shell_process.stdin.write(f"cd {shlex.quote(self.default_cwd)}\n")
+            self._shell_process.stdin.write(f"cd {shlex.quote(self.default_cwd)} >/dev/null 2>&1 || true\n")
+        self._shell_clean_mode = True
         self.is_interactive = True
         self._last_activity = time.monotonic()
         self._shell_reader_task = asyncio.create_task(self._read_shell_loop())
@@ -212,39 +220,59 @@ class AsyncSSHSession:
         ):
             return
 
-        begin_idx = self._command_buffer.find(self._command_begin_marker)
-        if begin_idx == -1:
-            return
-
-        begin_line_end = self._command_buffer.find("\n", begin_idx)
-        if begin_line_end == -1:
-            return
-
-        tail = self._command_buffer[begin_line_end + 1 :]
-        marker_pattern = re.compile(
-            rf"{re.escape(self._command_end_marker)}\|(-?\d+)\|([^\r\n]+)"
+        normalized = self._command_buffer.replace("\r", "\n")
+        begin_match = re.search(
+            rf"(?m)^{re.escape(self._command_begin_marker)}\s*$",
+            normalized,
         )
-        match = marker_pattern.search(tail)
-        if not match:
+        if not begin_match:
             return
 
-        output = tail[: match.start()]
-        exit_code = int(match.group(1))
-        cwd = match.group(2).strip()
+        tail = normalized[begin_match.end() :]
+        end_match = re.search(
+            rf"(?m)^{re.escape(self._command_end_marker)}\|(-?\d+)\|([^\r\n]+)\s*$",
+            tail,
+        )
+        if not end_match:
+            lower_tail = tail.lower()
+            if "[sudo] password for " in lower_tail or "password:" in lower_tail:
+                self._command_future.set_exception(RuntimeError("sudo password prompt detected"))
+            return
 
-        # Shell may echo the command line itself; remove a leading echoed line when present.
-        lines = output.replace("\r", "\n").split("\n")
-        cleaned_lines: list[str] = []
-        skipped_echo = False
-        for line in lines:
-            stripped = line.strip()
-            if not skipped_echo and stripped == self._command_text.strip():
-                skipped_echo = True
-                continue
-            cleaned_lines.append(line)
-        cleaned_output = "\n".join(cleaned_lines).strip("\n")
+        output = tail[: end_match.start()]
+        exit_code = int(end_match.group(1))
+        cwd = end_match.group(2).strip()
+        cleaned_output = self._cleanup_shell_output(output=output, command=self._command_text)
 
         self._command_future.set_result((cleaned_output, exit_code, cwd))
+
+    def _cleanup_shell_output(self, output: str, command: str) -> str:
+        lines = output.replace("\r", "\n").split("\n")
+        cleaned: list[str] = []
+        command_stripped = command.strip()
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                cleaned.append("")
+                continue
+            if stripped == command_stripped:
+                continue
+            if "__sshbot_status=$?" in stripped:
+                continue
+            if self._command_begin_marker and self._command_begin_marker in stripped:
+                continue
+            if self._command_end_marker and self._command_end_marker in stripped:
+                continue
+            if command_stripped and stripped.endswith(f"$ {command_stripped}"):
+                continue
+            cleaned.append(line)
+
+        while cleaned and not cleaned[0].strip():
+            cleaned.pop(0)
+        while cleaned and not cleaned[-1].strip():
+            cleaned.pop()
+        return "\n".join(cleaned)
 
     async def get_shell_cwd(self) -> str:
         if not self._shell_process or not self.is_interactive:
@@ -307,6 +335,13 @@ class AsyncSSHSession:
                 return result
             except asyncio.TimeoutError as exc:
                 raise RuntimeError("Command timed out in interactive shell") from exc
+            except RuntimeError as exc:
+                if "sudo password prompt detected" in str(exc):
+                    self._shell_process.stdin.write("\x03")
+                    raise RuntimeError(
+                        "sudo requested a password. Use a shell with NOPASSWD or run command without sudo in chat mode."
+                    ) from exc
+                raise
             finally:
                 self._command_begin_marker = None
                 self._command_end_marker = None
@@ -328,6 +363,7 @@ class AsyncSSHSession:
 
     async def close_shell(self) -> None:
         self.is_interactive = False
+        self._shell_clean_mode = False
 
         if self._probe_future and not self._probe_future.done():
             self._probe_future.set_exception(RuntimeError("Interactive shell closed"))

@@ -170,3 +170,26 @@ async def test_run_shell_command_uses_markers_and_parses_result() -> None:
     assert output == "file_a\nfile_b"
     assert exit_code == 0
     assert cwd == "/home/miad"
+
+
+@pytest.mark.asyncio
+async def test_run_shell_command_detects_sudo_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = asyncssh_runtime.AsyncSSHSession(user_id=6, name="sudo")
+    session.is_interactive = True
+    session._shell_process = _FakeShellProcess()
+
+    task = asyncio.create_task(session.run_shell_command("sudo ls"))
+    await asyncio.sleep(0)
+
+    begin = session._command_begin_marker
+    assert begin is not None
+    session._command_buffer = (
+        f"{begin}\n[sudo] password for ubuntu: "
+    )
+    session._try_finish_command()
+
+    with pytest.raises(RuntimeError) as exc:
+        await task
+
+    assert "sudo requested a password" in str(exc.value)
+    assert "\x03" in session._shell_process.stdin.writes[-1]
