@@ -19,6 +19,7 @@ class StartHandler:
         ("delserver", "Delete saved server"),
         ("shell", "Open interactive shell"),
         ("cancel", "Send Ctrl+C"),
+        ("enter", "Send Enter to shell"),
         ("pwd", "Show remote working directory"),
         ("exit", "Exit interactive shell"),
         ("group", "Assign servers to group"),
@@ -51,9 +52,10 @@ class StartHandler:
         "<b>Saved Servers</b>\n"
         "/save &lt;name&gt; [&lt;default_cwd&gt;]\n/quick &lt;name&gt;\n/servers\n/delserver &lt;name&gt;\n\n"
         "<b>Shell</b>\n"
-        "/shell\n/cancel\n/pwd\n/exit\n"
+        "/shell\n/cancel\n/enter\n/pwd\n/exit\n"
         "In interactive mode, shell state is persistent (cd/env/history).\n"
         "Each message you send is written to shell stdin (with Enter).\n"
+        "Use <code>/enter</code> to send an empty line/Enter key.\n"
         "Output streams live and updates in place.\n"
         "While a command is running, any message you send is forwarded to stdin.\n"
         "To run remote commands starting with slash, use <code>//command</code>.\n\n"

@@ -8,7 +8,7 @@ def test_bot_commands_include_core_entries() -> None:
     assert "connect" in command_names
     assert "save" in command_names
     assert "shell" in command_names
+    assert "enter" in command_names
     assert "upload" in command_names
     assert "monitor" in command_names
     assert "help" in command_names
-

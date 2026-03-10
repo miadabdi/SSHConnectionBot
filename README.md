@@ -29,8 +29,9 @@ Telegram SSH bot with multi-session support, persistent interactive shells, save
   - `/servers`, `/delserver <name>`
   - `/quick <name>` (kept as alias)
 - Shell:
-  - `/shell`, `/cancel`, `/pwd`, `/exit`
+  - `/shell`, `/cancel`, `/enter`, `/pwd`, `/exit`
   - In interactive mode, each message is sent to shell stdin with Enter
+  - `/enter` sends an empty line (Enter key) to the active shell
   - Output is streamed live by periodically updating one Telegram message per input turn
   - While a command is running, any message you send is forwarded to stdin
   - To run a remote command starting with `/`, use `//...`

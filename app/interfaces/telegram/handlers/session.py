@@ -39,6 +39,7 @@ class SessionHandler:
         self.router.message.register(self.cmd_shell, Command("shell"))
         self.router.message.register(self.cmd_exit, Command("exit"))
         self.router.message.register(self.cmd_cancel, Command("cancel"))
+        self.router.message.register(self.cmd_enter, Command("enter"))
         self.router.message.register(self.cmd_pwd, Command("pwd"))
         self.router.callback_query.register(self.cb_page, lambda c: c.data and c.data.startswith("page:"))
         self.router.callback_query.register(self.cb_noop, lambda c: c.data == "noop")
@@ -354,6 +355,24 @@ class SessionHandler:
             return
 
         await message.answer("⛔ Sent Ctrl+C to the active shell.")
+
+    async def cmd_enter(self, message: Message) -> None:
+        user_id = message.from_user.id
+        try:
+            await self.service.shell_input(user_id=user_id, text="")
+        except SessionUnavailableError:
+            await message.answer("ℹ️ Not in interactive mode.")
+            return
+        except Exception as exc:
+            await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
+            return
+
+        shell_state = self._shell_state.get(user_id)
+        if not shell_state:
+            return
+        rotate_stream = shell_state.get("rotate_stream")
+        if rotate_stream:
+            await rotate_stream()
 
     async def cmd_pwd(self, message: Message) -> None:
         user_id = message.from_user.id

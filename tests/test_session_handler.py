@@ -201,6 +201,22 @@ async def test_cmd_cancel_calls_shell_interrupt() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cmd_enter_sends_empty_input_to_shell() -> None:
+    service = _FakeCommandService(_FakeSession(is_interactive=True))
+    handler = SessionHandler(
+        service=service,
+        stream_publisher=_FakeStreamPublisher(),
+        stream_update_interval=0.2,
+    )
+    message = _FakeMessage("/enter")
+
+    await handler.cmd_enter(message)
+
+    assert service.shell_inputs == [""]
+    assert message.answers == []
+
+
+@pytest.mark.asyncio
 async def test_cmd_pwd_returns_current_directory() -> None:
     service = _FakeCommandService(_FakeSession(is_interactive=True))
     handler = SessionHandler(
