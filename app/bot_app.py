@@ -106,6 +106,12 @@ class BotApp:
         await self.mongo.connect()
         logger.info("Mongo connected")
 
+        try:
+            await bot.set_my_commands(StartHandler.bot_commands())
+            logger.info("Registered %d Telegram bot commands", len(StartHandler.COMMAND_CATALOG))
+        except Exception as exc:
+            logger.warning("Failed to register Telegram bot commands: %s", exc)
+
         if settings.session_timeout_minutes > 0:
             self._timeout_task = asyncio.create_task(self._timeout_watchdog())
             logger.info("Session timeout watchdog enabled (%d min)", settings.session_timeout_minutes)

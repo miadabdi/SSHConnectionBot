@@ -13,6 +13,7 @@ Telegram SSH bot with multi-session support, persistent interactive shells, save
 - Live output streaming + output paging
 - System monitor and session timeout watchdog
 - Optional Telegram user allowlist
+- Telegram slash-command autocomplete (`/` shows command list)
 
 ## Main Commands
 
