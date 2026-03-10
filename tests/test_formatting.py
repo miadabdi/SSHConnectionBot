@@ -20,3 +20,17 @@ def test_clean_terminal_output_strips_control_noise() -> None:
     assert "01;34m" not in cleaned
     assert "[?2004h" not in cleaned
     assert "folder" in cleaned
+
+
+def test_clean_terminal_output_strips_shell_markers_and_prompt_lines() -> None:
+    noisy = (
+        "__SSHBOT_CMD_BEGIN_abc__\n"
+        "0;miad@box: ~/app miad@box:~/app$ ls\n"
+        "miad@box:~/app$ \n"
+        "AGENTS.md\n"
+        "__SSHBOT_CMD_END_abc__|0|/home/miad\n"
+    )
+    cleaned = Formatter.clean_terminal_output(noisy)
+    assert "__SSHBOT" not in cleaned
+    assert "miad@box:~/app$" not in cleaned
+    assert "AGENTS.md" in cleaned

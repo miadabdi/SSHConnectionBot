@@ -24,6 +24,8 @@ class StartHandler:
         "<b>Shell</b>\n"
         "/shell\n/cancel\n/pwd\n/exit\n"
         "In interactive mode, shell state is persistent (cd/env/history).\n"
+        "Each message you send is written to shell stdin (with Enter).\n"
+        "Output streams live and updates in place; after you send input to a prompt, streaming continues in a new message.\n"
         "To run remote commands starting with slash, use <code>//command</code>.\n\n"
         "<b>Groups</b>\n"
         "/group &lt;name&gt; &lt;servers...&gt;\n/groups\n/delgroup &lt;name&gt;\n\n"

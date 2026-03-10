@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 
 from aiogram import Router
 from aiogram.filters import Command, StateFilter
@@ -15,6 +16,7 @@ from app.utils.formatting import Formatter, MAX_MESSAGE_LENGTH
 from app.utils.paging import OutputPager
 
 logger = logging.getLogger(__name__)
+StreamChunkCallback = Callable[[str], Awaitable[None]]
 
 
 class SessionHandler:
@@ -81,9 +83,46 @@ class SessionHandler:
             status = "✅" if result.exit_code == 0 else f"⚠️ Exit code: <code>{result.exit_code}</code>"
             await message.answer(f"Command completed with no output.\n{status}")
 
-    async def _send_output(self, message: Message, output: str, exit_code: int) -> None:
+    def _build_stream_callbacks(
+        self,
+        chat_id: int,
+    ) -> tuple[StreamChunkCallback, Callable[[], Awaitable[None]], Callable[[], str]]:
+        stream_id = self.stream.generate_stream_id()
+        buffer = ""
+        lock = asyncio.Lock()
+        last_publish = 0.0
+
+        async def publish(force: bool = False) -> None:
+            nonlocal last_publish
+            if not buffer.strip():
+                return
+            now = time.monotonic()
+            if not force and now - last_publish < self.stream_update_interval:
+                return
+            last_publish = now
+            rendered = Formatter.format_bash(Formatter.truncate(buffer))
+            await self.stream.publish(chat_id=chat_id, stream_id=stream_id, text=rendered, parse_mode="HTML")
+
+        async def on_stream(chunk: str) -> None:
+            nonlocal buffer
+            async with lock:
+                buffer += chunk
+                await publish(force=False)
+
+        async def flush() -> None:
+            async with lock:
+                await publish(force=True)
+
+        def get_buffer() -> str:
+            return buffer
+
+        return on_stream, flush, get_buffer
+
+    async def _send_output(self, message: Message, output: str, exit_code: int | None) -> None:
         formatted = Formatter.format_bash(output)
-        exit_suffix = f"\n⚠️ Exit code: <code>{exit_code}</code>" if exit_code != 0 else ""
+        exit_suffix = ""
+        if exit_code is not None and exit_code != 0:
+            exit_suffix = f"\n⚠️ Exit code: <code>{exit_code}</code>"
 
         if len(formatted) + len(exit_suffix) <= MAX_MESSAGE_LENGTH:
             await message.answer(formatted + exit_suffix)
@@ -147,10 +186,11 @@ class SessionHandler:
             await message.answer(f"❌ Failed to open shell: {Formatter.escape_html(str(exc))}")
             return
 
-        self._shell_state[user_id] = {"session": session.name}
+        self._shell_state[user_id] = {"session": session.name, "awaiting_input": False, "lock": asyncio.Lock()}
         await message.answer(
             f"🔁 Interactive shell opened on <code>{session.name}</code>.\n"
-            "Send commands directly and you'll get clean output.\n"
+            "Send commands directly; each message is sent to shell stdin.\n"
+            "Output streams live and updates in place.\n"
             "Use /cancel for Ctrl+C, /pwd to show current directory, and /exit to leave."
         )
 
@@ -176,12 +216,14 @@ class SessionHandler:
             await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
             return
 
+        shell_state = self._shell_state.setdefault(user_id, {})
+        shell_state["awaiting_input"] = False
         await message.answer("⛔ Sent Ctrl+C to the active shell.")
 
     async def cmd_pwd(self, message: Message) -> None:
         user_id = message.from_user.id
         try:
-            result = await self.service.shell_execute(user_id=user_id, command="pwd")
+            cwd = await self.service.shell_get_cwd(user_id=user_id)
         except SessionUnavailableError:
             await message.answer("ℹ️ Not in interactive mode.")
             return
@@ -189,7 +231,6 @@ class SessionHandler:
             await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
             return
 
-        cwd = result.output.strip() or result.cwd
         await message.answer(f"📁 <code>{Formatter.escape_html(cwd)}</code>")
 
     async def handle_message(self, message: Message) -> None:
@@ -215,25 +256,57 @@ class SessionHandler:
             return
 
         if session.is_interactive:
-            if self._looks_interactive_terminal_app(text):
-                await message.answer(
-                    "⚠️ Full-screen interactive programs are not supported in Telegram shell "
-                    "(e.g. vim/top/less)."
-                )
-                return
+            shell_state = self._shell_state.setdefault(
+                user_id,
+                {"session": session.name, "awaiting_input": False, "lock": asyncio.Lock()},
+            )
+            shell_lock: asyncio.Lock = shell_state.setdefault("lock", asyncio.Lock())
 
-            try:
-                result = await self.service.shell_execute(user_id=user_id, command=text)
-            except Exception as exc:
-                await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
-                return
+            async with shell_lock:
+                awaiting_input = bool(shell_state.get("awaiting_input"))
+                if not awaiting_input and self._looks_interactive_terminal_app(text):
+                    await message.answer(
+                        "⚠️ Full-screen interactive programs are not supported in Telegram shell "
+                        "(e.g. vim/top/less)."
+                    )
+                    return
 
-            if result.output.strip():
-                await self._send_output(message=message, output=result.output, exit_code=result.exit_code)
-            else:
-                status = "✅" if result.exit_code == 0 else f"⚠️ Exit code: <code>{result.exit_code}</code>"
-                await message.answer(f"Command completed with no output.\n{status}")
-            await message.answer(f"📁 <code>{Formatter.escape_html(result.cwd)}</code>")
+                on_stream, flush_stream, get_stream_buffer = self._build_stream_callbacks(chat_id=message.chat.id)
+                try:
+                    if awaiting_input:
+                        result = await self.service.shell_reply(
+                            user_id=user_id,
+                            text=text,
+                            on_stream_chunk=on_stream,
+                        )
+                    else:
+                        result = await self.service.shell_execute(
+                            user_id=user_id,
+                            command=text,
+                            on_stream_chunk=on_stream,
+                        )
+                    await flush_stream()
+                except Exception as exc:
+                    await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
+                    return
+
+                streamed_output = get_stream_buffer()
+                if result.output.strip() and not streamed_output.strip():
+                    await self._send_output(message=message, output=result.output, exit_code=result.exit_code)
+
+                if not result.done:
+                    shell_state["awaiting_input"] = True
+                    prompt = Formatter.escape_html(result.prompt or "Input required")
+                    await message.answer(
+                        f"🔐 Input required: <code>{prompt}</code>\n"
+                        "Reply with the required input, or use /cancel to abort."
+                    )
+                    return
+
+                shell_state["awaiting_input"] = False
+                if not result.output.strip():
+                    status = "✅" if result.exit_code == 0 else f"⚠️ Exit code: <code>{result.exit_code}</code>"
+                    await message.answer(f"Command completed with no output.\n{status}")
             return
 
         await message.answer(f"⚡ <code>[{session.name}]</code> {Formatter.escape_html(text)}")

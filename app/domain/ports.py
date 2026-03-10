@@ -89,7 +89,17 @@ class SSHRuntimeSession(Protocol):
 
     async def send_to_shell(self, text: str) -> None: ...
 
-    async def run_shell_command(self, command: str) -> tuple[str, int, str]: ...
+    async def run_shell_command(
+        self,
+        command: str,
+        on_output_chunk: OutputCallback | None = None,
+    ) -> tuple[str, int, str]: ...
+
+    async def reply_shell_prompt(
+        self,
+        text: str,
+        on_output_chunk: OutputCallback | None = None,
+    ) -> tuple[str, int, str]: ...
 
     async def interrupt_shell_command(self) -> None: ...
 

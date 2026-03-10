@@ -8,6 +8,8 @@ from collections.abc import Awaitable, Callable
 
 import asyncssh
 
+from app.domain.errors import InteractiveInputRequiredError
+
 logger = logging.getLogger(__name__)
 
 SSH_CONNECT_TIMEOUT = 15
@@ -40,7 +42,12 @@ class AsyncSSHSession:
         self._command_end_marker: str | None = None
         self._command_text: str = ""
         self._command_buffer: str = ""
-        self._command_future: asyncio.Future[tuple[str, int, str]] | None = None
+        self._command_done_future: asyncio.Future[tuple[str, int, str]] | None = None
+        self._command_prompt_future: asyncio.Future[tuple[str, str]] | None = None
+        self._command_output_callback: OutputCallback | None = None
+        self._command_streamed_output: str = ""
+        self._command_started = False
+        self._command_echo_stripped = False
         self._shell_clean_mode = False
 
         self.password_cache: str = ""
@@ -167,9 +174,9 @@ class AsyncSSHSession:
                         self._probe_buffer += chunk
                         self._try_finish_probe()
                         continue
-                    if self._command_future:
+                    if self._command_active():
                         self._command_buffer += chunk
-                        self._try_finish_command()
+                        await self._try_finish_command()
                         continue
                     await self._shell_callback(chunk)
                 except asyncio.TimeoutError:
@@ -211,58 +218,109 @@ class AsyncSSHSession:
         else:
             self._probe_future.set_exception(RuntimeError("Could not determine shell working directory"))
 
-    def _try_finish_command(self) -> None:
-        if (
-            not self._command_future
-            or not self._command_begin_marker
-            or not self._command_end_marker
-            or self._command_future.done()
-        ):
+    async def _try_finish_command(self) -> None:
+        if not self._command_active() or not self._command_begin_marker or not self._command_end_marker:
             return
 
         normalized = self._command_buffer.replace("\r", "\n")
-        begin_match = re.search(
-            rf"(?m)^{re.escape(self._command_begin_marker)}\s*$",
-            normalized,
-        )
-        if not begin_match:
+        if not self._command_started:
+            begin_marker_idx = normalized.find(self._command_begin_marker)
+            if begin_marker_idx < 0:
+                return
+            normalized = normalized[begin_marker_idx + len(self._command_begin_marker) :].lstrip("\n")
+            self._command_started = True
+
+        end_prefix = f"{self._command_end_marker}|"
+        end_idx = normalized.find(end_prefix)
+        if end_idx >= 0:
+            tail = normalized[end_idx + len(end_prefix) :]
+            end_match = re.match(r"(-?\d+)\|([^\r\n]+)", tail)
+            if not end_match:
+                self._command_buffer = normalized
+                return
+
+            output = normalized[:end_idx]
+            rest = tail[end_match.end() :]
+            self._command_buffer = rest
+            cleaned_output = self._cleanup_shell_output(output=output)
+            await self._emit_command_stream_delta(cleaned_output)
+            exit_code = int(end_match.group(1))
+            cwd = end_match.group(2).strip()
+            if self._command_done_future and not self._command_done_future.done():
+                self._command_done_future.set_result((cleaned_output, exit_code, cwd))
             return
 
-        tail = normalized[begin_match.end() :]
-        end_match = re.search(
-            rf"(?m)^{re.escape(self._command_end_marker)}\|(-?\d+)\|([^\r\n]+)\s*$",
-            tail,
-        )
-        if not end_match:
-            lower_tail = tail.lower()
-            if "[sudo] password for " in lower_tail or "password:" in lower_tail:
-                self._command_future.set_exception(RuntimeError("sudo password prompt detected"))
+        prompt_match = self._extract_interactive_prompt(normalized)
+        if not prompt_match:
+            cleaned_output = self._cleanup_shell_output(output=normalized)
+            await self._emit_command_stream_delta(cleaned_output)
+            self._command_buffer = normalized
             return
 
-        output = tail[: end_match.start()]
-        exit_code = int(end_match.group(1))
-        cwd = end_match.group(2).strip()
-        cleaned_output = self._cleanup_shell_output(output=output, command=self._command_text)
+        prompt_start, prompt_end, prompt_text = prompt_match
+        output = normalized[:prompt_start]
+        rest = normalized[prompt_end:]
+        self._command_buffer = rest
+        cleaned_output = self._cleanup_shell_output(output=output)
+        await self._emit_command_stream_delta(cleaned_output)
+        if self._command_prompt_future and not self._command_prompt_future.done():
+            self._command_prompt_future.set_result((cleaned_output, prompt_text))
 
-        self._command_future.set_result((cleaned_output, exit_code, cwd))
+    async def _emit_command_stream_delta(self, cleaned_output: str) -> None:
+        callback = self._command_output_callback
+        if not callback:
+            self._command_streamed_output = cleaned_output
+            return
 
-    def _cleanup_shell_output(self, output: str, command: str) -> str:
+        previous = self._command_streamed_output
+        if cleaned_output == previous:
+            return
+
+        if cleaned_output.startswith(previous):
+            delta = cleaned_output[len(previous) :]
+        else:
+            delta = cleaned_output
+
+        self._command_streamed_output = cleaned_output
+        if delta:
+            await callback(delta)
+
+    def _extract_interactive_prompt(self, text: str) -> tuple[int, int, str] | None:
+        prompt_patterns = [
+            re.compile(r"(?i)(\[sudo\]\s+password for [^:\n]+:\s*)$"),
+            re.compile(r"(?i)(password:\s*)$"),
+            re.compile(r"(?i)(passphrase.*:\s*)$"),
+            re.compile(r"(?i)(do you want to continue\?\s*\[y/n\]\s*)$"),
+            re.compile(r"(?i)(\[[y/n/]+\]\s*)$"),
+            re.compile(r"(?i)(\([y/n/]+\)\s*)$"),
+        ]
+        for pattern in prompt_patterns:
+            match = pattern.search(text)
+            if match:
+                return (match.start(1), match.end(1), match.group(1).strip())
+        return None
+
+    def _cleanup_shell_output(self, output: str) -> str:
         lines = output.replace("\r", "\n").split("\n")
         cleaned: list[str] = []
-        command_stripped = command.strip()
+        command_stripped = self._command_text.strip()
 
         for line in lines:
             stripped = line.strip()
             if not stripped:
                 cleaned.append("")
                 continue
-            if stripped == command_stripped:
+            if not self._command_echo_stripped and stripped == command_stripped:
+                self._command_echo_stripped = True
                 continue
             if "__sshbot_status=$?" in stripped:
                 continue
-            if self._command_begin_marker and self._command_begin_marker in stripped:
+            if "__SSHBOT_CMD_" in stripped:
                 continue
-            if self._command_end_marker and self._command_end_marker in stripped:
+            if "__SSHBOT_PWD_" in stripped:
+                continue
+            if stripped.startswith("0;") and "$" in stripped:
+                # Ignore shell title/prompt echoes (e.g. ]0;user@host: ...).
                 continue
             if command_stripped and stripped.endswith(f"$ {command_stripped}"):
                 continue
@@ -273,6 +331,43 @@ class AsyncSSHSession:
         while cleaned and not cleaned[-1].strip():
             cleaned.pop()
         return "\n".join(cleaned)
+
+    def _command_active(self) -> bool:
+        return self._command_done_future is not None
+
+    def _reset_command_state(self) -> None:
+        self._command_begin_marker = None
+        self._command_end_marker = None
+        self._command_text = ""
+        self._command_buffer = ""
+        self._command_done_future = None
+        self._command_prompt_future = None
+        self._command_output_callback = None
+        self._command_streamed_output = ""
+        self._command_started = False
+        self._command_echo_stripped = False
+
+    async def _wait_command_event(self) -> tuple[str, int, str]:
+        if not self._command_done_future:
+            raise RuntimeError("No shell command is running")
+        if not self._command_prompt_future:
+            raise RuntimeError("Command prompt watcher not initialized")
+
+        done, _ = await asyncio.wait(
+            {self._command_done_future, self._command_prompt_future},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if self._command_done_future in done:
+            output, exit_code, cwd = await self._command_done_future
+            self._reset_command_state()
+            self._last_activity = time.monotonic()
+            return output, exit_code, cwd
+
+        output, prompt = await self._command_prompt_future
+        self._command_prompt_future = asyncio.get_running_loop().create_future()
+        self._last_activity = time.monotonic()
+        raise InteractiveInputRequiredError(prompt=prompt, partial_output=output)
 
     async def get_shell_cwd(self) -> str:
         if not self._shell_process or not self.is_interactive:
@@ -304,14 +399,18 @@ class AsyncSSHSession:
                 self._probe_buffer = ""
                 self._probe_future = None
 
-    async def run_shell_command(self, command: str) -> tuple[str, int, str]:
+    async def run_shell_command(
+        self,
+        command: str,
+        on_output_chunk: OutputCallback | None = None,
+    ) -> tuple[str, int, str]:
         if not self._shell_process or not self.is_interactive:
             raise RuntimeError("No interactive shell active")
 
         async with self._command_lock:
             if self._probe_future and not self._probe_future.done():
                 raise RuntimeError("Shell probe already in progress")
-            if self._command_future and not self._command_future.done():
+            if self._command_active():
                 raise RuntimeError("Shell command already in progress")
 
             command_id = uuid.uuid4().hex
@@ -319,7 +418,12 @@ class AsyncSSHSession:
             self._command_end_marker = f"__SSHBOT_CMD_END_{command_id}__"
             self._command_text = command
             self._command_buffer = ""
-            self._command_future = asyncio.get_running_loop().create_future()
+            self._command_done_future = asyncio.get_running_loop().create_future()
+            self._command_prompt_future = asyncio.get_running_loop().create_future()
+            self._command_output_callback = on_output_chunk
+            self._command_streamed_output = ""
+            self._command_started = False
+            self._command_echo_stripped = False
 
             self._shell_process.stdin.write(f"printf '%s\\n' '{self._command_begin_marker}'\n")
             self._shell_process.stdin.write(f"{command}\n")
@@ -330,30 +434,41 @@ class AsyncSSHSession:
             )
 
             try:
-                result = await asyncio.wait_for(self._command_future, timeout=45.0)
-                self._last_activity = time.monotonic()
-                return result
-            except asyncio.TimeoutError as exc:
-                raise RuntimeError("Command timed out in interactive shell") from exc
-            except RuntimeError as exc:
-                if "sudo password prompt detected" in str(exc):
-                    self._shell_process.stdin.write("\x03")
-                    raise RuntimeError(
-                        "sudo requested a password. Use a shell with NOPASSWD or run command without sudo in chat mode."
-                    ) from exc
-                raise
+                return await self._wait_command_event()
             finally:
-                self._command_begin_marker = None
-                self._command_end_marker = None
-                self._command_text = ""
-                self._command_buffer = ""
-                self._command_future = None
+                if self._command_done_future and self._command_done_future.done():
+                    self._reset_command_state()
+
+    async def reply_shell_prompt(
+        self,
+        text: str,
+        on_output_chunk: OutputCallback | None = None,
+    ) -> tuple[str, int, str]:
+        if not self._shell_process or not self.is_interactive:
+            raise RuntimeError("No interactive shell active")
+
+        async with self._command_lock:
+            if not self._command_active():
+                raise RuntimeError("No interactive command is waiting for input")
+
+            self._command_output_callback = on_output_chunk
+            self._shell_process.stdin.write(text + "\n")
+            try:
+                return await self._wait_command_event()
+            finally:
+                if self._command_done_future and self._command_done_future.done():
+                    self._reset_command_state()
 
     async def interrupt_shell_command(self) -> None:
         if not self._shell_process or not self.is_interactive:
             raise RuntimeError("No interactive shell active")
         self._last_activity = time.monotonic()
         self._shell_process.stdin.write("\x03")
+        if self._command_done_future and not self._command_done_future.done():
+            self._command_done_future.set_exception(RuntimeError("Command interrupted"))
+        if self._command_prompt_future and not self._command_prompt_future.done():
+            self._command_prompt_future.set_exception(RuntimeError("Command interrupted"))
+        self._reset_command_state()
 
     async def send_to_shell(self, text: str) -> None:
         if not self._shell_process or not self.is_interactive:
@@ -371,13 +486,11 @@ class AsyncSSHSession:
         self._probe_end_marker = None
         self._probe_buffer = ""
         self._probe_future = None
-        if self._command_future and not self._command_future.done():
-            self._command_future.set_exception(RuntimeError("Interactive shell closed"))
-        self._command_begin_marker = None
-        self._command_end_marker = None
-        self._command_text = ""
-        self._command_buffer = ""
-        self._command_future = None
+        if self._command_done_future and not self._command_done_future.done():
+            self._command_done_future.set_exception(RuntimeError("Interactive shell closed"))
+        if self._command_prompt_future and not self._command_prompt_future.done():
+            self._command_prompt_future.set_exception(RuntimeError("Interactive shell closed"))
+        self._reset_command_state()
 
         if self._shell_reader_task:
             self._shell_reader_task.cancel()

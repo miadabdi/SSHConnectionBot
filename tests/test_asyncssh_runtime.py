@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from app.domain.errors import InteractiveInputRequiredError
 from app.infrastructure.ssh import asyncssh_runtime
 
 
@@ -163,7 +164,7 @@ async def test_run_shell_command_uses_markers_and_parses_result() -> None:
     assert begin is not None
     assert end is not None
     session._command_buffer = f"{begin}\nfile_a\nfile_b\n{end}|0|/home/miad\n"
-    session._try_finish_command()
+    await session._try_finish_command()
 
     output, exit_code, cwd = await task
 
@@ -173,7 +174,38 @@ async def test_run_shell_command_uses_markers_and_parses_result() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_shell_command_detects_sudo_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_shell_command_streams_intermediate_output() -> None:
+    session = asyncssh_runtime.AsyncSSHSession(user_id=8, name="stream")
+    session.is_interactive = True
+    session._shell_process = _FakeShellProcess()
+    streamed_chunks: list[str] = []
+
+    async def on_stream(chunk: str) -> None:
+        streamed_chunks.append(chunk)
+
+    task = asyncio.create_task(session.run_shell_command("ls -la", on_output_chunk=on_stream))
+    await asyncio.sleep(0)
+
+    begin = session._command_begin_marker
+    end = session._command_end_marker
+    assert begin is not None
+    assert end is not None
+
+    session._command_buffer = f"{begin}\nfile_a\n"
+    await session._try_finish_command()
+
+    session._command_buffer += f"file_b\n{end}|0|/home/miad\n"
+    await session._try_finish_command()
+
+    output, exit_code, cwd = await task
+    assert output == "file_a\nfile_b"
+    assert exit_code == 0
+    assert cwd == "/home/miad"
+    assert "".join(streamed_chunks) == "file_a\nfile_b"
+
+
+@pytest.mark.asyncio
+async def test_run_shell_command_detects_sudo_prompt() -> None:
     session = asyncssh_runtime.AsyncSSHSession(user_id=6, name="sudo")
     session.is_interactive = True
     session._shell_process = _FakeShellProcess()
@@ -186,10 +218,38 @@ async def test_run_shell_command_detects_sudo_prompt(monkeypatch: pytest.MonkeyP
     session._command_buffer = (
         f"{begin}\n[sudo] password for ubuntu: "
     )
-    session._try_finish_command()
+    await session._try_finish_command()
 
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(InteractiveInputRequiredError) as exc:
         await task
 
-    assert "sudo requested a password" in str(exc.value)
-    assert "\x03" in session._shell_process.stdin.writes[-1]
+    assert "password for ubuntu" in exc.value.prompt
+
+
+@pytest.mark.asyncio
+async def test_reply_shell_prompt_continues_pending_command() -> None:
+    session = asyncssh_runtime.AsyncSSHSession(user_id=7, name="prompt")
+    session.is_interactive = True
+    session._shell_process = _FakeShellProcess()
+
+    first = asyncio.create_task(session.run_shell_command("sudo ls"))
+    await asyncio.sleep(0)
+    begin = session._command_begin_marker
+    end = session._command_end_marker
+    assert begin is not None
+    assert end is not None
+    session._command_buffer = f"{begin}\n[sudo] password for ubuntu: "
+    await session._try_finish_command()
+
+    with pytest.raises(InteractiveInputRequiredError):
+        await first
+
+    second = asyncio.create_task(session.reply_shell_prompt("secret"))
+    await asyncio.sleep(0)
+    session._command_buffer = f"file_a\n{end}|0|/home/ubuntu\n"
+    await session._try_finish_command()
+
+    output, exit_code, cwd = await second
+    assert output == "file_a"
+    assert exit_code == 0
+    assert cwd == "/home/ubuntu"

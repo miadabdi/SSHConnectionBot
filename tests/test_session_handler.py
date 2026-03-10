@@ -10,12 +10,14 @@ from app.interfaces.telegram.handlers.session import SessionHandler
 class _FakeStreamPublisher:
     def __init__(self) -> None:
         self._stream_id = 0
+        self.published: list[tuple[int, int, str, str]] = []
 
     def generate_stream_id(self) -> int:
         self._stream_id += 1
         return self._stream_id
 
     async def publish(self, chat_id: int, stream_id: int, text: str, parse_mode: str = "HTML") -> bool:
+        self.published.append((chat_id, stream_id, text, parse_mode))
         return True
 
 
@@ -38,12 +40,32 @@ class _FakeCommandService:
         self.sessions = _FakeSessions(session)
         self.shell_commands: list[str] = []
         self.interrupt_calls = 0
+        self.prompt_mode = False
 
-    async def shell_execute(self, user_id: int, command: str) -> ShellCommandResult:
+    async def shell_execute(self, user_id: int, command: str, on_stream_chunk=None) -> ShellCommandResult:
         self.shell_commands.append(command)
+        if on_stream_chunk and command != "pwd":
+            await on_stream_chunk(f"ran:{command}")
         if command == "pwd":
             return ShellCommandResult(output="/srv/app", exit_code=0, cwd="/srv/app")
+        if self.prompt_mode and command == "sudo apt update":
+            return ShellCommandResult(
+                output="",
+                exit_code=None,
+                cwd="",
+                done=False,
+                prompt="[sudo] password for ubuntu:",
+            )
         return ShellCommandResult(output=f"ran:{command}", exit_code=0, cwd="/srv/app")
+
+    async def shell_reply(self, user_id: int, text: str, on_stream_chunk=None) -> ShellCommandResult:
+        self.shell_commands.append(f"reply:{text}")
+        if on_stream_chunk:
+            await on_stream_chunk(f"reply-ran:{text}")
+        return ShellCommandResult(output=f"reply-ran:{text}", exit_code=0, cwd="/srv/app")
+
+    async def shell_get_cwd(self, user_id: int) -> str:
+        return "/srv/app"
 
     async def shell_interrupt(self, user_id: int) -> None:
         self.interrupt_calls += 1
@@ -89,9 +111,10 @@ async def test_handle_message_blocks_single_slash_commands_non_interactive(monke
 @pytest.mark.asyncio
 async def test_handle_message_allows_double_slash_escape_in_interactive_mode() -> None:
     service = _FakeCommandService(_FakeSession(is_interactive=True))
+    stream = _FakeStreamPublisher()
     handler = SessionHandler(
         service=service,
-        stream_publisher=_FakeStreamPublisher(),
+        stream_publisher=stream,
         stream_update_interval=0.2,
     )
     message = _FakeMessage("//usr/bin/id")
@@ -99,7 +122,7 @@ async def test_handle_message_allows_double_slash_escape_in_interactive_mode() -
     await handler.handle_message(message)
 
     assert service.shell_commands == ["/usr/bin/id"]
-    assert any("ran:/usr/bin/id" in item for item in message.answers)
+    assert any("ran:/usr/bin/id" in item[2] for item in stream.published)
 
 
 @pytest.mark.asyncio
@@ -151,5 +174,28 @@ async def test_cmd_pwd_returns_current_directory() -> None:
 
     await handler.cmd_pwd(message)
 
-    assert service.shell_commands == ["pwd"]
+    assert service.shell_commands == []
     assert "/srv/app" in message.answers[-1]
+
+
+@pytest.mark.asyncio
+async def test_handle_message_interactive_prompt_then_reply() -> None:
+    service = _FakeCommandService(_FakeSession(is_interactive=True))
+    service.prompt_mode = True
+    stream = _FakeStreamPublisher()
+    handler = SessionHandler(
+        service=service,
+        stream_publisher=stream,
+        stream_update_interval=0.2,
+    )
+    user_id = 10
+    handler._shell_state[user_id] = {"session": "main", "awaiting_input": False}
+
+    first = _FakeMessage("sudo apt update", user_id=user_id)
+    await handler.handle_message(first)
+    assert any("Input required" in line for line in first.answers)
+
+    second = _FakeMessage("secret", user_id=user_id)
+    await handler.handle_message(second)
+    assert "reply:secret" in service.shell_commands
+    assert any("reply-ran:secret" in item[2] for item in stream.published)

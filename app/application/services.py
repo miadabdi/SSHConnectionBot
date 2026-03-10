@@ -6,8 +6,22 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.domain.entities import CommandResult, Macro, SavedServer, ServerGroup, SSHSessionSnapshot
-from app.domain.errors import NotFoundError, SessionUnavailableError, ValidationError
-from app.domain.ports import GroupRepository, MacroRepository, MonitorCollector, SavedServerRepository, SecretCipher, SessionHistoryRepository, SessionRegistry
+from app.domain.errors import (
+    InteractiveInputRequiredError,
+    NotFoundError,
+    SessionUnavailableError,
+    ValidationError,
+)
+from app.domain.ports import (
+    GroupRepository,
+    MacroRepository,
+    MonitorCollector,
+    OutputCallback,
+    SavedServerRepository,
+    SecretCipher,
+    SessionHistoryRepository,
+    SessionRegistry,
+)
 
 
 @dataclass(slots=True)
@@ -21,8 +35,10 @@ class DisconnectResult:
 @dataclass(slots=True)
 class ShellCommandResult:
     output: str
-    exit_code: int
+    exit_code: int | None
     cwd: str
+    done: bool = True
+    prompt: str = ""
 
 
 class ConnectionService:
@@ -225,13 +241,55 @@ class CommandService:
             raise SessionUnavailableError("No interactive session")
         await session.send_to_shell(text)
 
-    async def shell_execute(self, user_id: int, command: str) -> ShellCommandResult:
+    async def shell_execute(
+        self,
+        user_id: int,
+        command: str,
+        on_stream_chunk: OutputCallback | None = None,
+    ) -> ShellCommandResult:
         session = self.sessions.get_active(user_id)
         if not session or not session.is_interactive:
             raise SessionUnavailableError("No interactive session")
 
-        output, exit_code, cwd = await session.run_shell_command(command)
-        return ShellCommandResult(output=output, exit_code=exit_code, cwd=cwd)
+        try:
+            output, exit_code, cwd = await session.run_shell_command(command, on_output_chunk=on_stream_chunk)
+            return ShellCommandResult(output=output, exit_code=exit_code, cwd=cwd, done=True)
+        except InteractiveInputRequiredError as exc:
+            return ShellCommandResult(
+                output=exc.partial_output,
+                exit_code=None,
+                cwd="",
+                done=False,
+                prompt=exc.prompt,
+            )
+
+    async def shell_reply(
+        self,
+        user_id: int,
+        text: str,
+        on_stream_chunk: OutputCallback | None = None,
+    ) -> ShellCommandResult:
+        session = self.sessions.get_active(user_id)
+        if not session or not session.is_interactive:
+            raise SessionUnavailableError("No interactive session")
+
+        try:
+            output, exit_code, cwd = await session.reply_shell_prompt(text, on_output_chunk=on_stream_chunk)
+            return ShellCommandResult(output=output, exit_code=exit_code, cwd=cwd, done=True)
+        except InteractiveInputRequiredError as exc:
+            return ShellCommandResult(
+                output=exc.partial_output,
+                exit_code=None,
+                cwd="",
+                done=False,
+                prompt=exc.prompt,
+            )
+
+    async def shell_get_cwd(self, user_id: int) -> str:
+        session = self.sessions.get_active(user_id)
+        if not session or not session.is_interactive:
+            raise SessionUnavailableError("No interactive session")
+        return await session.get_shell_cwd()
 
     async def shell_interrupt(self, user_id: int) -> None:
         session = self.sessions.get_active(user_id)

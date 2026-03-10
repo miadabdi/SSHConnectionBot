@@ -7,6 +7,9 @@ ANSI_ESCAPE_RE = re.compile(
 )
 RAW_SGR_RE = re.compile(r"\[[0-9;]*m")
 RAW_BRACKETED_PASTE_RE = re.compile(r"\[\?2004[hl]")
+SSHBOT_MARKER_RE = re.compile(r"^__SSHBOT_[^\n]*$", re.MULTILINE)
+OSC_PROMPT_NOISE_RE = re.compile(r"^0;[^\n]*\$\s*", re.MULTILINE)
+SHELL_PROMPT_LINE_RE = re.compile(r"^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:[^\n]*[$#]\s*$", re.MULTILINE)
 
 
 class Formatter:
@@ -24,6 +27,9 @@ class Formatter:
         cleaned = ANSI_ESCAPE_RE.sub("", text)
         cleaned = RAW_BRACKETED_PASTE_RE.sub("", cleaned)
         cleaned = RAW_SGR_RE.sub("", cleaned)
+        cleaned = SSHBOT_MARKER_RE.sub("", cleaned)
+        cleaned = OSC_PROMPT_NOISE_RE.sub("", cleaned)
+        cleaned = SHELL_PROMPT_LINE_RE.sub("", cleaned)
         return cleaned
 
     @staticmethod
