@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import time
 import uuid
@@ -47,22 +48,34 @@ class SessionHandler:
         user_id = message.from_user.id
         chat_id = message.chat.id
 
-        stream_id = self.stream.generate_stream_id()
+        stream_ids = [self.stream.generate_stream_id()]
+        last_pages: list[str] = []
         buffer = ""
         lock = asyncio.Lock()
         last_publish = 0.0
         delayed_publish_task: asyncio.Task | None = None
 
         async def publish(force: bool = False) -> None:
-            nonlocal last_publish
+            nonlocal last_publish, last_pages
             if not buffer.strip():
                 return
             now = time.monotonic()
             if not force and now - last_publish < self.stream_update_interval:
                 return
             last_publish = now
-            rendered = Formatter.format_bash(Formatter.truncate(buffer))
-            await self.stream.publish(chat_id=chat_id, stream_id=stream_id, text=rendered, parse_mode="HTML")
+            pages = self._format_stream_pages(buffer)
+            for index, rendered in enumerate(pages):
+                if index >= len(stream_ids):
+                    stream_ids.append(self.stream.generate_stream_id())
+                if index < len(last_pages) and last_pages[index] == rendered:
+                    continue
+                await self.stream.publish(
+                    chat_id=chat_id,
+                    stream_id=stream_ids[index],
+                    text=rendered,
+                    parse_mode="HTML",
+                )
+            last_pages = pages
 
         async def delayed_publish(delay: float) -> None:
             nonlocal delayed_publish_task
@@ -130,12 +143,13 @@ class SessionHandler:
         Callable[[], Awaitable[None]],
     ]:
         stream_ctx = {
-            "stream_id": self.stream.generate_stream_id(),
+            "stream_ids": [self.stream.generate_stream_id()],
             "buffer": "",
             "lock": asyncio.Lock(),
             "last_publish": 0.0,
             "has_streamed": False,
             "delayed_publish_task": None,
+            "last_pages": [],
         }
         shell_state["stream_ctx"] = stream_ctx
 
@@ -146,13 +160,19 @@ class SessionHandler:
             if not force and now - stream_ctx["last_publish"] < self.stream_update_interval:
                 return
             stream_ctx["last_publish"] = now
-            rendered = Formatter.format_bash(Formatter.truncate(stream_ctx["buffer"]))
-            await self.stream.publish(
-                chat_id=chat_id,
-                stream_id=stream_ctx["stream_id"],
-                text=rendered,
-                parse_mode="HTML",
-            )
+            pages = self._format_stream_pages(stream_ctx["buffer"])
+            for index, rendered in enumerate(pages):
+                if index >= len(stream_ctx["stream_ids"]):
+                    stream_ctx["stream_ids"].append(self.stream.generate_stream_id())
+                if index < len(stream_ctx["last_pages"]) and stream_ctx["last_pages"][index] == rendered:
+                    continue
+                await self.stream.publish(
+                    chat_id=chat_id,
+                    stream_id=stream_ctx["stream_ids"][index],
+                    text=rendered,
+                    parse_mode="HTML",
+                )
+            stream_ctx["last_pages"] = pages
 
         async def delayed_publish(delay: float) -> None:
             try:
@@ -198,11 +218,42 @@ class SessionHandler:
                 if delayed_task:
                     delayed_task.cancel()
                     stream_ctx["delayed_publish_task"] = None
-                stream_ctx["stream_id"] = self.stream.generate_stream_id()
+                stream_ctx["stream_ids"] = [self.stream.generate_stream_id()]
                 stream_ctx["buffer"] = ""
                 stream_ctx["last_publish"] = 0.0
+                stream_ctx["last_pages"] = []
 
         return on_stream, flush, get_stream_meta, rotate_stream
+
+    @staticmethod
+    def _format_stream_pages(raw_output: str) -> list[str]:
+        cleaned = Formatter.clean_terminal_output(raw_output)
+        prefix = '<pre><code class="language-bash">'
+        suffix = "</code></pre>"
+        max_content_length = MAX_MESSAGE_LENGTH - len(prefix) - len(suffix)
+
+        if max_content_length <= 0:
+            return [Formatter.format_bash(cleaned)]
+
+        pages: list[str] = []
+        current: list[str] = []
+        current_length = 0
+
+        for char in cleaned:
+            escaped = html.escape(char, quote=False)
+            escaped_length = len(escaped)
+            if current and current_length + escaped_length > max_content_length:
+                pages.append(prefix + "".join(current) + suffix)
+                current = [escaped]
+                current_length = escaped_length
+            else:
+                current.append(escaped)
+                current_length += escaped_length
+
+        if current:
+            pages.append(prefix + "".join(current) + suffix)
+
+        return pages or [prefix + suffix]
 
     async def _send_output(self, message: Message, output: str, exit_code: int | None) -> None:
         formatted = Formatter.format_bash(output)

@@ -100,6 +100,15 @@ class _DelayedOutputCommandService(_FakeCommandService):
         return ShellCommandResult(output="first second", exit_code=0, cwd="/srv/app")
 
 
+class _LargeOutputCommandService(_FakeCommandService):
+    async def shell_execute(self, user_id: int, command: str, on_stream_chunk=None) -> ShellCommandResult:
+        self.shell_commands.append(command)
+        large_output = "x" * 12000
+        if on_stream_chunk:
+            await on_stream_chunk(large_output)
+        return ShellCommandResult(output=large_output, exit_code=0, cwd="/srv/app")
+
+
 class _FakeMessage:
     def __init__(self, text: str, user_id: int = 10, chat_id: int = 99) -> None:
         self.text = text
@@ -311,3 +320,20 @@ async def test_stream_flushes_buffer_when_command_pauses_without_new_output() ->
 
     service.release.set()
     await task
+
+
+@pytest.mark.asyncio
+async def test_stream_splits_long_output_across_multiple_messages() -> None:
+    service = _LargeOutputCommandService(_FakeSession(is_interactive=True))
+    stream = _FakeStreamPublisher()
+    handler = SessionHandler(
+        service=service,
+        stream_publisher=stream,
+        stream_update_interval=0.0,
+    )
+
+    message = _FakeMessage("long-output")
+    await handler.handle_message(message)
+
+    stream_ids = {stream_id for _, stream_id, _, _ in stream.published}
+    assert len(stream_ids) >= 2
