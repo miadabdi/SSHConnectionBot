@@ -28,8 +28,8 @@ Telegram SSH bot with multi-session support, persistent interactive shells, save
   - `/servers`, `/delserver <name>`
   - `/quick <name>` (kept as alias)
 - Shell:
-  - `/shell`, `/exit`
-  - In interactive mode, messages are sent to the current shell state
+  - `/shell`, `/cancel`, `/pwd`, `/exit`
+  - In interactive mode, commands return clean per-command output (no raw terminal control bytes)
   - To run a remote command starting with `/`, use `//...`
 - Files:
   - `/download <remote_path>`

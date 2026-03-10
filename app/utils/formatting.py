@@ -1,6 +1,12 @@
 import html
+import re
 
 MAX_MESSAGE_LENGTH = 4096
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))"
+)
+RAW_SGR_RE = re.compile(r"\[[0-9;]*m")
+RAW_BRACKETED_PASTE_RE = re.compile(r"\[\?2004[hl]")
 
 
 class Formatter:
@@ -10,8 +16,15 @@ class Formatter:
 
     @staticmethod
     def format_bash(text: str) -> str:
-        escaped = html.escape(text, quote=False)
+        escaped = html.escape(Formatter.clean_terminal_output(text), quote=False)
         return f'<pre><code class="language-bash">{escaped}</code></pre>'
+
+    @staticmethod
+    def clean_terminal_output(text: str) -> str:
+        cleaned = ANSI_ESCAPE_RE.sub("", text)
+        cleaned = RAW_BRACKETED_PASTE_RE.sub("", cleaned)
+        cleaned = RAW_SGR_RE.sub("", cleaned)
+        return cleaned
 
     @staticmethod
     def truncate(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> str:

@@ -147,3 +147,26 @@ async def test_get_shell_cwd_from_active_shell_probe() -> None:
 
     assert cwd == "/home/miad/project"
     assert session._shell_process.stdin.writes
+
+
+@pytest.mark.asyncio
+async def test_run_shell_command_uses_markers_and_parses_result() -> None:
+    session = asyncssh_runtime.AsyncSSHSession(user_id=5, name="shell")
+    session.is_interactive = True
+    session._shell_process = _FakeShellProcess()
+
+    task = asyncio.create_task(session.run_shell_command("ls -la"))
+    await asyncio.sleep(0)
+
+    begin = session._command_begin_marker
+    end = session._command_end_marker
+    assert begin is not None
+    assert end is not None
+    session._command_buffer = f"{begin}\nfile_a\nfile_b\n{end}|0|/home/miad\n"
+    session._try_finish_command()
+
+    output, exit_code, cwd = await task
+
+    assert output == "file_a\nfile_b"
+    assert exit_code == 0
+    assert cwd == "/home/miad"

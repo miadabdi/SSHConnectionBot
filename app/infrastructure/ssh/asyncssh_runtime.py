@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import shlex
 import time
 import uuid
@@ -34,6 +35,12 @@ class AsyncSSHSession:
         self._probe_end_marker: str | None = None
         self._probe_buffer: str = ""
         self._probe_future: asyncio.Future[str] | None = None
+        self._command_lock = asyncio.Lock()
+        self._command_begin_marker: str | None = None
+        self._command_end_marker: str | None = None
+        self._command_text: str = ""
+        self._command_buffer: str = ""
+        self._command_future: asyncio.Future[tuple[str, int, str]] | None = None
 
         self.password_cache: str = ""
         self.key_cache: bytes = b""
@@ -152,6 +159,10 @@ class AsyncSSHSession:
                         self._probe_buffer += chunk
                         self._try_finish_probe()
                         continue
+                    if self._command_future:
+                        self._command_buffer += chunk
+                        self._try_finish_command()
+                        continue
                     await self._shell_callback(chunk)
                 except asyncio.TimeoutError:
                     continue
@@ -192,6 +203,49 @@ class AsyncSSHSession:
         else:
             self._probe_future.set_exception(RuntimeError("Could not determine shell working directory"))
 
+    def _try_finish_command(self) -> None:
+        if (
+            not self._command_future
+            or not self._command_begin_marker
+            or not self._command_end_marker
+            or self._command_future.done()
+        ):
+            return
+
+        begin_idx = self._command_buffer.find(self._command_begin_marker)
+        if begin_idx == -1:
+            return
+
+        begin_line_end = self._command_buffer.find("\n", begin_idx)
+        if begin_line_end == -1:
+            return
+
+        tail = self._command_buffer[begin_line_end + 1 :]
+        marker_pattern = re.compile(
+            rf"{re.escape(self._command_end_marker)}\|(-?\d+)\|([^\r\n]+)"
+        )
+        match = marker_pattern.search(tail)
+        if not match:
+            return
+
+        output = tail[: match.start()]
+        exit_code = int(match.group(1))
+        cwd = match.group(2).strip()
+
+        # Shell may echo the command line itself; remove a leading echoed line when present.
+        lines = output.replace("\r", "\n").split("\n")
+        cleaned_lines: list[str] = []
+        skipped_echo = False
+        for line in lines:
+            stripped = line.strip()
+            if not skipped_echo and stripped == self._command_text.strip():
+                skipped_echo = True
+                continue
+            cleaned_lines.append(line)
+        cleaned_output = "\n".join(cleaned_lines).strip("\n")
+
+        self._command_future.set_result((cleaned_output, exit_code, cwd))
+
     async def get_shell_cwd(self) -> str:
         if not self._shell_process or not self.is_interactive:
             raise RuntimeError("No interactive shell active")
@@ -222,6 +276,50 @@ class AsyncSSHSession:
                 self._probe_buffer = ""
                 self._probe_future = None
 
+    async def run_shell_command(self, command: str) -> tuple[str, int, str]:
+        if not self._shell_process or not self.is_interactive:
+            raise RuntimeError("No interactive shell active")
+
+        async with self._command_lock:
+            if self._probe_future and not self._probe_future.done():
+                raise RuntimeError("Shell probe already in progress")
+            if self._command_future and not self._command_future.done():
+                raise RuntimeError("Shell command already in progress")
+
+            command_id = uuid.uuid4().hex
+            self._command_begin_marker = f"__SSHBOT_CMD_BEGIN_{command_id}__"
+            self._command_end_marker = f"__SSHBOT_CMD_END_{command_id}__"
+            self._command_text = command
+            self._command_buffer = ""
+            self._command_future = asyncio.get_running_loop().create_future()
+
+            self._shell_process.stdin.write(f"printf '%s\\n' '{self._command_begin_marker}'\n")
+            self._shell_process.stdin.write(f"{command}\n")
+            self._shell_process.stdin.write(
+                "__sshbot_status=$?; "
+                f"printf '%s|%s|%s\\n' '{self._command_end_marker}' "
+                '"$__sshbot_status" "$PWD"\n'
+            )
+
+            try:
+                result = await asyncio.wait_for(self._command_future, timeout=45.0)
+                self._last_activity = time.monotonic()
+                return result
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Command timed out in interactive shell") from exc
+            finally:
+                self._command_begin_marker = None
+                self._command_end_marker = None
+                self._command_text = ""
+                self._command_buffer = ""
+                self._command_future = None
+
+    async def interrupt_shell_command(self) -> None:
+        if not self._shell_process or not self.is_interactive:
+            raise RuntimeError("No interactive shell active")
+        self._last_activity = time.monotonic()
+        self._shell_process.stdin.write("\x03")
+
     async def send_to_shell(self, text: str) -> None:
         if not self._shell_process or not self.is_interactive:
             raise RuntimeError("No interactive shell active")
@@ -237,6 +335,13 @@ class AsyncSSHSession:
         self._probe_end_marker = None
         self._probe_buffer = ""
         self._probe_future = None
+        if self._command_future and not self._command_future.done():
+            self._command_future.set_exception(RuntimeError("Interactive shell closed"))
+        self._command_begin_marker = None
+        self._command_end_marker = None
+        self._command_text = ""
+        self._command_buffer = ""
+        self._command_future = None
 
         if self._shell_reader_task:
             self._shell_reader_task.cancel()

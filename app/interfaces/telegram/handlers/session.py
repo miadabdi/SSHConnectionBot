@@ -35,6 +35,8 @@ class SessionHandler:
     def _register(self) -> None:
         self.router.message.register(self.cmd_shell, Command("shell"))
         self.router.message.register(self.cmd_exit, Command("exit"))
+        self.router.message.register(self.cmd_cancel, Command("cancel"))
+        self.router.message.register(self.cmd_pwd, Command("pwd"))
         self.router.callback_query.register(self.cb_page, lambda c: c.data and c.data.startswith("page:"))
         self.router.callback_query.register(self.cb_noop, lambda c: c.data == "noop")
         self.router.message.register(self.handle_message, StateFilter(default_state))
@@ -132,28 +134,9 @@ class SessionHandler:
             await message.answer("ℹ️ Already in interactive mode. Use /exit to leave.")
             return
 
-        stream_id = self.stream.generate_stream_id()
-        shell_buffer = ""
-        lock = asyncio.Lock()
-        last_publish = 0.0
-
         async def on_shell_chunk(chunk: str) -> None:
-            nonlocal shell_buffer, last_publish
-            async with lock:
-                shell_buffer += chunk
-                now = time.monotonic()
-                if now - last_publish < self.stream_update_interval:
-                    return
-                last_publish = now
-
-                trimmed = shell_buffer[-3500:] if len(shell_buffer) > 3500 else shell_buffer
-                rendered = Formatter.format_bash(trimmed)
-                await self.stream.publish(
-                    chat_id=message.chat.id,
-                    stream_id=stream_id,
-                    text=rendered,
-                    parse_mode="HTML",
-                )
+            # Command-reply shell mode intentionally suppresses raw terminal byte stream.
+            return None
 
         try:
             session = await self.service.enter_shell(user_id=user_id, on_stream_chunk=on_shell_chunk)
@@ -164,10 +147,11 @@ class SessionHandler:
             await message.answer(f"❌ Failed to open shell: {Formatter.escape_html(str(exc))}")
             return
 
-        self._shell_state[user_id] = {"stream_id": stream_id}
+        self._shell_state[user_id] = {"session": session.name}
         await message.answer(
             f"🔁 Interactive shell opened on <code>{session.name}</code>.\n"
-            f"Type commands directly. Use /exit to leave."
+            "Send commands directly and you'll get clean output.\n"
+            "Use /cancel for Ctrl+C, /pwd to show current directory, and /exit to leave."
         )
 
     async def cmd_exit(self, message: Message) -> None:
@@ -180,6 +164,33 @@ class SessionHandler:
 
         self._shell_state.pop(user_id, None)
         await message.answer(f"📝 Exited interactive shell on <code>{session.name}</code>.")
+
+    async def cmd_cancel(self, message: Message) -> None:
+        user_id = message.from_user.id
+        try:
+            await self.service.shell_interrupt(user_id)
+        except SessionUnavailableError:
+            await message.answer("ℹ️ Not in interactive mode.")
+            return
+        except Exception as exc:
+            await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
+            return
+
+        await message.answer("⛔ Sent Ctrl+C to the active shell.")
+
+    async def cmd_pwd(self, message: Message) -> None:
+        user_id = message.from_user.id
+        try:
+            result = await self.service.shell_execute(user_id=user_id, command="pwd")
+        except SessionUnavailableError:
+            await message.answer("ℹ️ Not in interactive mode.")
+            return
+        except Exception as exc:
+            await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
+            return
+
+        cwd = result.output.strip() or result.cwd
+        await message.answer(f"📁 <code>{Formatter.escape_html(cwd)}</code>")
 
     async def handle_message(self, message: Message) -> None:
         if not message.text:
@@ -204,11 +215,31 @@ class SessionHandler:
             return
 
         if session.is_interactive:
+            if self._looks_interactive_terminal_app(text):
+                await message.answer(
+                    "⚠️ Full-screen interactive programs are not supported in Telegram shell "
+                    "(e.g. vim/top/less)."
+                )
+                return
+
             try:
-                await self.service.shell_input(user_id=user_id, text=text)
+                result = await self.service.shell_execute(user_id=user_id, command=text)
             except Exception as exc:
                 await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
+                return
+
+            if result.output.strip():
+                await self._send_output(message=message, output=result.output, exit_code=result.exit_code)
+            else:
+                status = "✅" if result.exit_code == 0 else f"⚠️ Exit code: <code>{result.exit_code}</code>"
+                await message.answer(f"Command completed with no output.\n{status}")
+            await message.answer(f"📁 <code>{Formatter.escape_html(result.cwd)}</code>")
             return
 
         await message.answer(f"⚡ <code>[{session.name}]</code> {Formatter.escape_html(text)}")
         await self.execute_command(message=message, command=text)
+
+    @staticmethod
+    def _looks_interactive_terminal_app(command: str) -> bool:
+        token = command.strip().split(maxsplit=1)[0].lower() if command.strip() else ""
+        return token in {"vim", "vi", "nano", "top", "htop", "less", "more", "man", "watch"}

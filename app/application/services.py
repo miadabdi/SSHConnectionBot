@@ -18,6 +18,13 @@ class DisconnectResult:
     port: int = 0
 
 
+@dataclass(slots=True)
+class ShellCommandResult:
+    output: str
+    exit_code: int
+    cwd: str
+
+
 class ConnectionService:
     def __init__(
         self,
@@ -217,6 +224,20 @@ class CommandService:
         if not session or not session.is_interactive:
             raise SessionUnavailableError("No interactive session")
         await session.send_to_shell(text)
+
+    async def shell_execute(self, user_id: int, command: str) -> ShellCommandResult:
+        session = self.sessions.get_active(user_id)
+        if not session or not session.is_interactive:
+            raise SessionUnavailableError("No interactive session")
+
+        output, exit_code, cwd = await session.run_shell_command(command)
+        return ShellCommandResult(output=output, exit_code=exit_code, cwd=cwd)
+
+    async def shell_interrupt(self, user_id: int) -> None:
+        session = self.sessions.get_active(user_id)
+        if not session or not session.is_interactive:
+            raise SessionUnavailableError("No interactive session")
+        await session.interrupt_shell_command()
 
 
 class SavedServerService:

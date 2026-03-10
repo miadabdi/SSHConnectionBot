@@ -22,7 +22,7 @@ class StartHandler:
         "<b>Saved Servers</b>\n"
         "/save &lt;name&gt; [&lt;default_cwd&gt;]\n/quick &lt;name&gt;\n/servers\n/delserver &lt;name&gt;\n\n"
         "<b>Shell</b>\n"
-        "/shell\n/exit\n"
+        "/shell\n/cancel\n/pwd\n/exit\n"
         "In interactive mode, shell state is persistent (cd/env/history).\n"
         "To run remote commands starting with slash, use <code>//command</code>.\n\n"
         "<b>Groups</b>\n"

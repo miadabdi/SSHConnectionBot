@@ -1,6 +1,4 @@
-import asyncio
 import logging
-import time
 from base64 import b64decode, b64encode
 from io import BytesIO
 
@@ -118,28 +116,9 @@ class ConnectHandler:
         if session.is_interactive:
             return
 
-        stream_id = self.stream.generate_stream_id()
-        shell_buffer = ""
-        lock = asyncio.Lock()
-        last_publish = 0.0
-
         async def on_shell_chunk(chunk: str) -> None:
-            nonlocal shell_buffer, last_publish
-            async with lock:
-                shell_buffer += chunk
-                now = time.monotonic()
-                if now - last_publish < self.stream_update_interval:
-                    return
-                last_publish = now
-
-                trimmed = shell_buffer[-3500:] if len(shell_buffer) > 3500 else shell_buffer
-                rendered = Formatter.format_bash(trimmed)
-                await self.stream.publish(
-                    chat_id=message.chat.id,
-                    stream_id=stream_id,
-                    text=rendered,
-                    parse_mode="HTML",
-                )
+            # Interactive shell runs in command-reply mode; background prompt noise is ignored.
+            return None
 
         await session.open_shell(on_shell_chunk)
 
