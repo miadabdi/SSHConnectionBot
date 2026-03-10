@@ -51,25 +51,61 @@ class SessionHandler:
         buffer = ""
         lock = asyncio.Lock()
         last_publish = 0.0
+        delayed_publish_task: asyncio.Task | None = None
+
+        async def publish(force: bool = False) -> None:
+            nonlocal last_publish
+            if not buffer.strip():
+                return
+            now = time.monotonic()
+            if not force and now - last_publish < self.stream_update_interval:
+                return
+            last_publish = now
+            rendered = Formatter.format_bash(Formatter.truncate(buffer))
+            await self.stream.publish(chat_id=chat_id, stream_id=stream_id, text=rendered, parse_mode="HTML")
+
+        async def delayed_publish(delay: float) -> None:
+            nonlocal delayed_publish_task
+            try:
+                await asyncio.sleep(delay)
+                async with lock:
+                    await publish(force=True)
+            except asyncio.CancelledError:
+                return
+            finally:
+                delayed_publish_task = None
 
         async def on_stream(chunk: str) -> None:
-            nonlocal buffer, last_publish
+            nonlocal buffer, delayed_publish_task
             async with lock:
                 buffer += chunk
                 now = time.monotonic()
-                if now - last_publish < self.stream_update_interval:
+                elapsed = now - last_publish
+                if elapsed >= self.stream_update_interval:
+                    if delayed_publish_task:
+                        delayed_publish_task.cancel()
+                        delayed_publish_task = None
+                    await publish(force=False)
                     return
-                last_publish = now
-
-                rendered = Formatter.format_bash(Formatter.truncate(buffer))
-                await self.stream.publish(chat_id=chat_id, stream_id=stream_id, text=rendered, parse_mode="HTML")
+                if delayed_publish_task is None:
+                    delay = self.stream_update_interval - elapsed
+                    delayed_publish_task = asyncio.create_task(delayed_publish(delay))
 
         try:
             result = await self.service.execute(user_id=user_id, command=command, on_stream_chunk=on_stream)
+            async with lock:
+                if delayed_publish_task:
+                    delayed_publish_task.cancel()
+                    delayed_publish_task = None
+                await publish(force=True)
         except SessionUnavailableError:
             await message.answer("ℹ️ No active SSH session. Use /connect first.")
             return
         except Exception as exc:
+            async with lock:
+                if delayed_publish_task:
+                    delayed_publish_task.cancel()
+                    delayed_publish_task = None
             text = str(exc)
             if "Disconnect" in text or "closed" in text:
                 await message.answer("⚠️ SSH connection was lost. Use /connect to reconnect.")
@@ -99,6 +135,7 @@ class SessionHandler:
             "lock": asyncio.Lock(),
             "last_publish": 0.0,
             "has_streamed": False,
+            "delayed_publish_task": None,
         }
         shell_state["stream_ctx"] = stream_ctx
 
@@ -117,15 +154,39 @@ class SessionHandler:
                 parse_mode="HTML",
             )
 
+        async def delayed_publish(delay: float) -> None:
+            try:
+                await asyncio.sleep(delay)
+                async with stream_ctx["lock"]:
+                    await publish(force=True)
+            except asyncio.CancelledError:
+                return
+            finally:
+                stream_ctx["delayed_publish_task"] = None
+
         async def on_stream(chunk: str) -> None:
             async with stream_ctx["lock"]:
                 if chunk:
                     stream_ctx["buffer"] += chunk
                     stream_ctx["has_streamed"] = True
-                await publish(force=False)
+                elapsed = time.monotonic() - stream_ctx["last_publish"]
+                if elapsed >= self.stream_update_interval:
+                    delayed_task = stream_ctx["delayed_publish_task"]
+                    if delayed_task:
+                        delayed_task.cancel()
+                        stream_ctx["delayed_publish_task"] = None
+                    await publish(force=False)
+                    return
+                if stream_ctx["delayed_publish_task"] is None:
+                    delay = self.stream_update_interval - elapsed
+                    stream_ctx["delayed_publish_task"] = asyncio.create_task(delayed_publish(delay))
 
         async def flush() -> None:
             async with stream_ctx["lock"]:
+                delayed_task = stream_ctx["delayed_publish_task"]
+                if delayed_task:
+                    delayed_task.cancel()
+                    stream_ctx["delayed_publish_task"] = None
                 await publish(force=True)
 
         def get_stream_meta() -> tuple[str, bool]:
@@ -133,6 +194,10 @@ class SessionHandler:
 
         async def rotate_stream() -> None:
             async with stream_ctx["lock"]:
+                delayed_task = stream_ctx["delayed_publish_task"]
+                if delayed_task:
+                    delayed_task.cancel()
+                    stream_ctx["delayed_publish_task"] = None
                 stream_ctx["stream_id"] = self.stream.generate_stream_id()
                 stream_ctx["buffer"] = ""
                 stream_ctx["last_publish"] = 0.0

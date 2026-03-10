@@ -84,6 +84,22 @@ class _BlockingCommandService(_FakeCommandService):
         return ShellCommandResult(output="phase1phase2", exit_code=0, cwd="/srv/app")
 
 
+class _DelayedOutputCommandService(_FakeCommandService):
+    def __init__(self, session: _FakeSession) -> None:
+        super().__init__(session)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def shell_execute(self, user_id: int, command: str, on_stream_chunk=None) -> ShellCommandResult:
+        self.shell_commands.append(command)
+        if on_stream_chunk:
+            await on_stream_chunk("first")
+            await on_stream_chunk(" second")
+        self.started.set()
+        await self.release.wait()
+        return ShellCommandResult(output="first second", exit_code=0, cwd="/srv/app")
+
+
 class _FakeMessage:
     def __init__(self, text: str, user_id: int = 10, chat_id: int = 99) -> None:
         self.text = text
@@ -274,3 +290,24 @@ async def test_running_command_rotates_stream_after_user_input() -> None:
     assert len(phase1_streams) == 1
     assert len(phase2_streams) == 1
     assert phase1_streams != phase2_streams
+
+
+@pytest.mark.asyncio
+async def test_stream_flushes_buffer_when_command_pauses_without_new_output() -> None:
+    service = _DelayedOutputCommandService(_FakeSession(is_interactive=True))
+    stream = _FakeStreamPublisher()
+    handler = SessionHandler(
+        service=service,
+        stream_publisher=stream,
+        stream_update_interval=0.2,
+    )
+
+    message = _FakeMessage("sudo dnstt-deploy")
+    task = asyncio.create_task(handler.handle_message(message))
+    await service.started.wait()
+    await asyncio.sleep(0.25)
+
+    assert any("first second" in item[2] for item in stream.published)
+
+    service.release.set()
+    await task
