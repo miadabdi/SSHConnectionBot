@@ -2,10 +2,20 @@
 
 این پوشه نسخه بازطراحی‌شده ربات SSH تلگرام با معماری تمیز است.
 
+## قابلیت‌ها
+
+- اتصال همزمان به چند سرور با سشن‌های نام‌دار
+- احراز هویت با پسورد و کلید خصوصی (حتی کلید دارای passphrase)
+- شل تعاملی پایدار (`/shell`) با حفظ وضعیت (`cd`, env, history)
+- ذخیره سرور و اتصال سریع با `/connect <saved_name>`
+- امکان تنظیم مسیر پیش‌فرض هر سرور با `/save <name> [default_cwd]`
+- آپلود/دانلود فایل از طریق SFTP
+- ماکروها، گروه‌بندی سرورها، مانیتور سیستم
+
 ## شروع سریع
 
 ```bash
-cd v2
+cd SSHConnectionBot
 make init
 make keygen
 # کلید تولید شده را در .env به عنوان ENCRYPTION_KEY قرار دهید
@@ -16,11 +26,22 @@ make logs
 
 ## دستورات اصلی
 
-- `/connect`، `/disconnect [name|all]`، `/switch`، `/status`، `/history`
-- `/save`، `/quick`، `/servers`، `/delserver`
+- اتصال:
+  - `/connect` (ویزارد دستی)
+  - `/connect <saved_name>` (اتصال به سرور ذخیره‌شده + باز شدن شل تعاملی)
+  - `/disconnect [name|all]`، `/switch <name>`، `/status`، `/sessions`، `/history`
+- سرورهای ذخیره‌شده:
+  - `/save <name> [default_cwd]`
+  - `/save <name> -` برای پاک کردن مسیر پیش‌فرض
+  - `/quick <name>` (alias)، `/servers`، `/delserver <name>`
 - `/group`، `/groups`، `/delgroup`
 - `/macro`، `/macros`، `/run`، `/delmacro`
-- `/download`، آپلود با کپشن `/upload <remote_path>`
+- فایل:
+  - `/download <remote_path>`
+  - در پاسخ (Reply) به پیام فایل/مدیا: `/upload [remote_path]`
+  - حالت قدیمی: کپشن فایل `/upload [remote_path]`
+  - اگر `remote_path` ندهید، مقصد از مسیر فعلی شل تعاملی (`$PWD`) گرفته می‌شود
 - `/monitor`، `/shell`، `/exit`
+- برای اجرای دستور ریموتی که با `/` شروع می‌شود، از `//command` استفاده کنید.
 
 برای جزئیات کامل به `README.md` مراجعه کنید.

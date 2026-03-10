@@ -1,25 +1,45 @@
 # SSHConnection v2
 
-A clean-architecture rebuild of the Telegram SSH bot under `v2/` with near-full feature parity.
+Telegram SSH bot with multi-session support, persistent interactive shells, saved servers, file transfer, and monitoring.
 
 ## Features
 
-- Multi-session SSH with named sessions
-- Password and private-key authentication
-- Live output streaming with `sendMessageDraft` + automatic classic fallback
-- Interactive shell mode
-- Output paging for large results
-- Saved servers + quick connect
-- Server groups
-- Macros
-- SFTP upload/download
-- System monitor
-- Session timeout watchdog
+- Multi-session SSH with named sessions (`/switch`, `/sessions`)
+- Password and private-key authentication (including passphrase-protected keys)
+- Persistent interactive shell mode (`/shell`) with slash escaping (`//command`)
+- Saved servers with reconnect (`/connect <saved_name>`) and optional default cwd
+- Upload/download over SFTP
+- Server groups and command macros
+- Live output streaming + output paging
+- System monitor and session timeout watchdog
 - Optional Telegram user allowlist
+
+## Main Commands
+
+- Connection:
+  - `/connect` (manual wizard)
+  - `/connect <saved_name>` (reconnect saved server, opens interactive shell)
+  - `/disconnect [name|all]`
+  - `/switch <session_name>`
+  - `/status`, `/sessions`, `/history`
+- Saved servers:
+  - `/save <name> [default_cwd]`
+  - `/save <name> -` to clear saved default cwd
+  - `/servers`, `/delserver <name>`
+  - `/quick <name>` (kept as alias)
+- Shell:
+  - `/shell`, `/exit`
+  - In interactive mode, messages are sent to the current shell state
+  - To run a remote command starting with `/`, use `//...`
+- Files:
+  - `/download <remote_path>`
+  - Reply to a file/media message with `/upload [remote_path]`
+  - Legacy: upload with caption `/upload [remote_path]`
+  - If `remote_path` is omitted, upload uses active interactive shell `$PWD`
 
 ## Quick Start (Docker)
 
-1. `cd v2`
+1. `cd SSHConnectionBot`
 2. `make init`
 3. `make keygen` and put generated key into `.env` as `ENCRYPTION_KEY`
 4. Fill `BOT_TOKEN` in `.env`
@@ -29,7 +49,7 @@ A clean-architecture rebuild of the Telegram SSH bot under `v2/` with near-full 
 ## Local Run
 
 ```bash
-cd v2
+cd SSHConnectionBot
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -40,7 +60,7 @@ python -m app.main
 ## Tests and Lint
 
 ```bash
-cd v2
+cd SSHConnectionBot
 make test
 make lint
 ```
