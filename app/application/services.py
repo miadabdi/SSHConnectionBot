@@ -7,7 +7,6 @@ from typing import Any
 
 from app.domain.entities import CommandResult, Macro, SavedServer, ServerGroup, SSHSessionSnapshot
 from app.domain.errors import (
-    InteractiveInputRequiredError,
     NotFoundError,
     SessionUnavailableError,
     ValidationError,
@@ -251,17 +250,8 @@ class CommandService:
         if not session or not session.is_interactive:
             raise SessionUnavailableError("No interactive session")
 
-        try:
-            output, exit_code, cwd = await session.run_shell_command(command, on_output_chunk=on_stream_chunk)
-            return ShellCommandResult(output=output, exit_code=exit_code, cwd=cwd, done=True)
-        except InteractiveInputRequiredError as exc:
-            return ShellCommandResult(
-                output=exc.partial_output,
-                exit_code=None,
-                cwd="",
-                done=False,
-                prompt=exc.prompt,
-            )
+        output, exit_code, cwd = await session.run_shell_command(command, on_output_chunk=on_stream_chunk)
+        return ShellCommandResult(output=output, exit_code=exit_code, cwd=cwd, done=True)
 
     async def shell_reply(
         self,
@@ -273,17 +263,8 @@ class CommandService:
         if not session or not session.is_interactive:
             raise SessionUnavailableError("No interactive session")
 
-        try:
-            output, exit_code, cwd = await session.reply_shell_prompt(text, on_output_chunk=on_stream_chunk)
-            return ShellCommandResult(output=output, exit_code=exit_code, cwd=cwd, done=True)
-        except InteractiveInputRequiredError as exc:
-            return ShellCommandResult(
-                output=exc.partial_output,
-                exit_code=None,
-                cwd="",
-                done=False,
-                prompt=exc.prompt,
-            )
+        output, exit_code, cwd = await session.reply_shell_prompt(text, on_output_chunk=on_stream_chunk)
+        return ShellCommandResult(output=output, exit_code=exit_code, cwd=cwd, done=True)
 
     async def shell_get_cwd(self, user_id: int) -> str:
         session = self.sessions.get_active(user_id)

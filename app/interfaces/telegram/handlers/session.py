@@ -186,7 +186,7 @@ class SessionHandler:
             await message.answer(f"❌ Failed to open shell: {Formatter.escape_html(str(exc))}")
             return
 
-        self._shell_state[user_id] = {"session": session.name, "awaiting_input": False, "lock": asyncio.Lock()}
+        self._shell_state[user_id] = {"session": session.name, "lock": asyncio.Lock()}
         await message.answer(
             f"🔁 Interactive shell opened on <code>{session.name}</code>.\n"
             "Send commands directly; each message is sent to shell stdin.\n"
@@ -216,8 +216,6 @@ class SessionHandler:
             await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
             return
 
-        shell_state = self._shell_state.setdefault(user_id, {})
-        shell_state["awaiting_input"] = False
         await message.answer("⛔ Sent Ctrl+C to the active shell.")
 
     async def cmd_pwd(self, message: Message) -> None:
@@ -256,15 +254,22 @@ class SessionHandler:
             return
 
         if session.is_interactive:
-            shell_state = self._shell_state.setdefault(
-                user_id,
-                {"session": session.name, "awaiting_input": False, "lock": asyncio.Lock()},
-            )
+            shell_state = self._shell_state.get(user_id)
+            if not shell_state or shell_state.get("session") != session.name:
+                shell_state = {"session": session.name, "lock": asyncio.Lock()}
+                self._shell_state[user_id] = shell_state
             shell_lock: asyncio.Lock = shell_state.setdefault("lock", asyncio.Lock())
 
+            if shell_lock.locked():
+                try:
+                    await self.service.shell_input(user_id=user_id, text=text)
+                except Exception as exc:
+                    await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
+                    return
+                return
+
             async with shell_lock:
-                awaiting_input = bool(shell_state.get("awaiting_input"))
-                if not awaiting_input and self._looks_interactive_terminal_app(text):
+                if self._looks_interactive_terminal_app(text):
                     await message.answer(
                         "⚠️ Full-screen interactive programs are not supported in Telegram shell "
                         "(e.g. vim/top/less)."
@@ -273,18 +278,11 @@ class SessionHandler:
 
                 on_stream, flush_stream, get_stream_buffer = self._build_stream_callbacks(chat_id=message.chat.id)
                 try:
-                    if awaiting_input:
-                        result = await self.service.shell_reply(
-                            user_id=user_id,
-                            text=text,
-                            on_stream_chunk=on_stream,
-                        )
-                    else:
-                        result = await self.service.shell_execute(
-                            user_id=user_id,
-                            command=text,
-                            on_stream_chunk=on_stream,
-                        )
+                    result = await self.service.shell_execute(
+                        user_id=user_id,
+                        command=text,
+                        on_stream_chunk=on_stream,
+                    )
                     await flush_stream()
                 except Exception as exc:
                     if str(exc).strip() == "Command interrupted":
@@ -295,17 +293,6 @@ class SessionHandler:
                 streamed_output = get_stream_buffer()
                 if result.output.strip() and not streamed_output.strip():
                     await self._send_output(message=message, output=result.output, exit_code=result.exit_code)
-
-                if not result.done:
-                    shell_state["awaiting_input"] = True
-                    prompt = Formatter.escape_html(result.prompt or "Input required")
-                    await message.answer(
-                        f"🔐 Input required: <code>{prompt}</code>\n"
-                        "Reply with the required input, or use /cancel to abort."
-                    )
-                    return
-
-                shell_state["awaiting_input"] = False
                 if not result.output.strip():
                     status = "✅" if result.exit_code == 0 else f"⚠️ Exit code: <code>{result.exit_code}</code>"
                     await message.answer(f"Command completed with no output.\n{status}")

@@ -2,7 +2,6 @@ import asyncio
 
 import pytest
 
-from app.domain.errors import InteractiveInputRequiredError
 from app.infrastructure.ssh import asyncssh_runtime
 
 
@@ -205,7 +204,7 @@ async def test_run_shell_command_streams_intermediate_output() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_shell_command_detects_sudo_prompt() -> None:
+async def test_run_shell_command_waits_for_end_marker_with_prompt_like_output() -> None:
     session = asyncssh_runtime.AsyncSSHSession(user_id=6, name="sudo")
     session.is_interactive = True
     session._shell_process = _FakeShellProcess()
@@ -214,73 +213,27 @@ async def test_run_shell_command_detects_sudo_prompt() -> None:
     await asyncio.sleep(0)
 
     begin = session._command_begin_marker
-    assert begin is not None
-    assert len(session._shell_process.stdin.writes) == 1
-    assert "sudo ls" in session._shell_process.stdin.writes[0]
-    assert "__sshbot_status=$?" in session._shell_process.stdin.writes[0]
-    session._command_buffer = (
-        f"{begin}\n[sudo] password for ubuntu: "
-    )
-    await session._try_finish_command()
-
-    with pytest.raises(InteractiveInputRequiredError) as exc:
-        await task
-
-    assert "password for ubuntu" in exc.value.prompt
-
-
-@pytest.mark.asyncio
-async def test_reply_shell_prompt_continues_pending_command() -> None:
-    session = asyncssh_runtime.AsyncSSHSession(user_id=7, name="prompt")
-    session.is_interactive = True
-    session._shell_process = _FakeShellProcess()
-
-    first = asyncio.create_task(session.run_shell_command("sudo ls"))
-    await asyncio.sleep(0)
-    begin = session._command_begin_marker
     end = session._command_end_marker
     assert begin is not None
     assert end is not None
+    assert len(session._shell_process.stdin.writes) == 1
+    assert "sudo ls" in session._shell_process.stdin.writes[0]
+
     session._command_buffer = f"{begin}\n[sudo] password for ubuntu: "
     await session._try_finish_command()
+    assert task.done() is False
 
-    with pytest.raises(InteractiveInputRequiredError):
-        await first
+    await session.send_to_shell("secret")
+    assert session._shell_process.stdin.writes[-1] == "secret\n"
 
-    second = asyncio.create_task(session.reply_shell_prompt("secret"))
-    await asyncio.sleep(0)
-    session._command_buffer = f"file_a\n{end}|0|/home/ubuntu\n"
+    session._command_buffer += f"\nfile_a\n{end}|0|/home/ubuntu\n"
     await session._try_finish_command()
 
-    output, exit_code, cwd = await second
-    assert output == "file_a"
+    output, exit_code, cwd = await task
+    assert "password for ubuntu" in output
+    assert "file_a" in output
     assert exit_code == 0
     assert cwd == "/home/ubuntu"
-
-
-@pytest.mark.asyncio
-async def test_run_shell_command_detects_question_menu_prompt() -> None:
-    session = asyncssh_runtime.AsyncSSHSession(user_id=9, name="menu")
-    session.is_interactive = True
-    session._shell_process = _FakeShellProcess()
-
-    task = asyncio.create_task(session.run_shell_command("sudo dnstt-deploy"))
-    await asyncio.sleep(0)
-
-    begin = session._command_begin_marker
-    assert begin is not None
-    session._command_buffer = (
-        f"{begin}\n"
-        "[INFO] Checking for script updates...\n"
-        "[INFO] Script is up to date\n\n"
-        "[QUESTION] Please select an option (0-5): "
-    )
-    await session._try_finish_command()
-
-    with pytest.raises(InteractiveInputRequiredError) as exc:
-        await task
-
-    assert "Please select an option (0-5)" in exc.value.prompt
 
 
 @pytest.mark.asyncio
@@ -296,3 +249,34 @@ async def test_interrupt_shell_command_does_not_raise_none_await_race() -> None:
 
     with pytest.raises(RuntimeError, match="Command interrupted"):
         await task
+
+
+@pytest.mark.asyncio
+async def test_run_shell_command_waits_for_end_marker_with_menu_output() -> None:
+    session = asyncssh_runtime.AsyncSSHSession(user_id=11, name="marzban")
+    session.is_interactive = True
+    session._shell_process = _FakeShellProcess()
+
+    task = asyncio.create_task(session.run_shell_command("sudo marzban core-update"))
+    await asyncio.sleep(0)
+
+    begin = session._command_begin_marker
+    end = session._command_end_marker
+    assert begin is not None
+    assert end is not None
+    session._command_buffer = (
+        f"{begin}\n"
+        "==============================\n"
+        "Choose a version to install (1-10), or press M to enter manually, Q to quit: "
+    )
+    await session._try_finish_command()
+    assert task.done() is False
+
+    await session.send_to_shell("Q")
+    session._command_buffer += f"\n{end}|0|/home/miad\n"
+    await session._try_finish_command()
+
+    output, exit_code, cwd = await task
+    assert "Choose a version to install" in output
+    assert exit_code == 0
+    assert cwd == "/home/miad"

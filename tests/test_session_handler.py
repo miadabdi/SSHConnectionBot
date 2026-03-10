@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -39,8 +40,8 @@ class _FakeCommandService:
     def __init__(self, session: _FakeSession) -> None:
         self.sessions = _FakeSessions(session)
         self.shell_commands: list[str] = []
+        self.shell_inputs: list[str] = []
         self.interrupt_calls = 0
-        self.prompt_mode = False
 
     async def shell_execute(self, user_id: int, command: str, on_stream_chunk=None) -> ShellCommandResult:
         self.shell_commands.append(command)
@@ -48,14 +49,6 @@ class _FakeCommandService:
             await on_stream_chunk(f"ran:{command}")
         if command == "pwd":
             return ShellCommandResult(output="/srv/app", exit_code=0, cwd="/srv/app")
-        if self.prompt_mode and command == "sudo apt update":
-            return ShellCommandResult(
-                output="",
-                exit_code=None,
-                cwd="",
-                done=False,
-                prompt="[sudo] password for ubuntu:",
-            )
         return ShellCommandResult(output=f"ran:{command}", exit_code=0, cwd="/srv/app")
 
     async def shell_reply(self, user_id: int, text: str, on_stream_chunk=None) -> ShellCommandResult:
@@ -66,6 +59,9 @@ class _FakeCommandService:
 
     async def shell_get_cwd(self, user_id: int) -> str:
         return "/srv/app"
+
+    async def shell_input(self, user_id: int, text: str) -> None:
+        self.shell_inputs.append(text)
 
     async def shell_interrupt(self, user_id: int) -> None:
         self.interrupt_calls += 1
@@ -179,26 +175,20 @@ async def test_cmd_pwd_returns_current_directory() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_message_interactive_prompt_then_reply() -> None:
+async def test_handle_message_interactive_executes_command() -> None:
     service = _FakeCommandService(_FakeSession(is_interactive=True))
-    service.prompt_mode = True
     stream = _FakeStreamPublisher()
     handler = SessionHandler(
         service=service,
         stream_publisher=stream,
         stream_update_interval=0.2,
     )
-    user_id = 10
-    handler._shell_state[user_id] = {"session": "main", "awaiting_input": False}
 
-    first = _FakeMessage("sudo apt update", user_id=user_id)
-    await handler.handle_message(first)
-    assert any("Input required" in line for line in first.answers)
+    message = _FakeMessage("sudo apt update")
+    await handler.handle_message(message)
 
-    second = _FakeMessage("secret", user_id=user_id)
-    await handler.handle_message(second)
-    assert "reply:secret" in service.shell_commands
-    assert any("reply-ran:secret" in item[2] for item in stream.published)
+    assert service.shell_commands == ["sudo apt update"]
+    assert any("ran:sudo apt update" in item[2] for item in stream.published)
 
 
 @pytest.mark.asyncio
@@ -217,4 +207,24 @@ async def test_handle_message_ignores_command_interrupted_error(monkeypatch: pyt
     monkeypatch.setattr(service, "shell_execute", interrupted)
     await handler.handle_message(message)
 
+    assert message.answers == []
+
+
+@pytest.mark.asyncio
+async def test_handle_message_forwards_input_when_command_is_running() -> None:
+    service = _FakeCommandService(_FakeSession(is_interactive=True))
+    handler = SessionHandler(
+        service=service,
+        stream_publisher=_FakeStreamPublisher(),
+        stream_update_interval=0.2,
+    )
+    user_id = 10
+    lock = asyncio.Lock()
+    await lock.acquire()
+    handler._shell_state[user_id] = {"session": "main", "lock": lock}
+
+    message = _FakeMessage("1", user_id=user_id)
+    await handler.handle_message(message)
+
+    assert service.shell_inputs == ["1"]
     assert message.answers == []
