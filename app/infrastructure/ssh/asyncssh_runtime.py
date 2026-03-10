@@ -425,13 +425,14 @@ class AsyncSSHSession:
             self._command_started = False
             self._command_echo_stripped = False
 
-            self._shell_process.stdin.write(f"printf '%s\\n' '{self._command_begin_marker}'\n")
-            self._shell_process.stdin.write(f"{command}\n")
-            self._shell_process.stdin.write(
+            wrapped_command = (
+                f"printf '%s\\n' {shlex.quote(self._command_begin_marker)}; "
+                f"eval -- {shlex.quote(command)}; "
                 "__sshbot_status=$?; "
-                f"printf '%s|%s|%s\\n' '{self._command_end_marker}' "
-                '"$__sshbot_status" "$PWD"\n'
+                f"printf '%s|%s|%s\\n' {shlex.quote(self._command_end_marker)} "
+                '"$__sshbot_status" "$PWD"'
             )
+            self._shell_process.stdin.write(wrapped_command + "\n")
 
             try:
                 return await self._wait_command_event()

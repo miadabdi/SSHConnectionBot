@@ -215,6 +215,9 @@ async def test_run_shell_command_detects_sudo_prompt() -> None:
 
     begin = session._command_begin_marker
     assert begin is not None
+    assert len(session._shell_process.stdin.writes) == 1
+    assert "sudo ls" in session._shell_process.stdin.writes[0]
+    assert "__sshbot_status=$?" in session._shell_process.stdin.writes[0]
     session._command_buffer = (
         f"{begin}\n[sudo] password for ubuntu: "
     )
