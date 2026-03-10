@@ -281,3 +281,18 @@ async def test_run_shell_command_detects_question_menu_prompt() -> None:
         await task
 
     assert "Please select an option (0-5)" in exc.value.prompt
+
+
+@pytest.mark.asyncio
+async def test_interrupt_shell_command_does_not_raise_none_await_race() -> None:
+    session = asyncssh_runtime.AsyncSSHSession(user_id=10, name="interrupt")
+    session.is_interactive = True
+    session._shell_process = _FakeShellProcess()
+
+    task = asyncio.create_task(session.run_shell_command("sleep 10"))
+    await asyncio.sleep(0)
+
+    await session.interrupt_shell_command()
+
+    with pytest.raises(RuntimeError, match="Command interrupted"):
+        await task

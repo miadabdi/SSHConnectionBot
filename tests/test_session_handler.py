@@ -199,3 +199,22 @@ async def test_handle_message_interactive_prompt_then_reply() -> None:
     await handler.handle_message(second)
     assert "reply:secret" in service.shell_commands
     assert any("reply-ran:secret" in item[2] for item in stream.published)
+
+
+@pytest.mark.asyncio
+async def test_handle_message_ignores_command_interrupted_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _FakeCommandService(_FakeSession(is_interactive=True))
+    handler = SessionHandler(
+        service=service,
+        stream_publisher=_FakeStreamPublisher(),
+        stream_update_interval=0.2,
+    )
+    message = _FakeMessage("ls")
+
+    async def interrupted(*args, **kwargs):
+        raise RuntimeError("Command interrupted")
+
+    monkeypatch.setattr(service, "shell_execute", interrupted)
+    await handler.handle_message(message)
+
+    assert message.answers == []

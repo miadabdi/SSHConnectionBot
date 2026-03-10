@@ -353,24 +353,28 @@ class AsyncSSHSession:
         self._command_echo_stripped = False
 
     async def _wait_command_event(self) -> tuple[str, int, str]:
-        if not self._command_done_future:
+        command_done_future = self._command_done_future
+        command_prompt_future = self._command_prompt_future
+
+        if not command_done_future:
             raise RuntimeError("No shell command is running")
-        if not self._command_prompt_future:
+        if not command_prompt_future:
             raise RuntimeError("Command prompt watcher not initialized")
 
         done, _ = await asyncio.wait(
-            {self._command_done_future, self._command_prompt_future},
+            {command_done_future, command_prompt_future},
             return_when=asyncio.FIRST_COMPLETED,
         )
 
-        if self._command_done_future in done:
-            output, exit_code, cwd = await self._command_done_future
+        if command_done_future in done:
+            output, exit_code, cwd = await command_done_future
             self._reset_command_state()
             self._last_activity = time.monotonic()
             return output, exit_code, cwd
 
-        output, prompt = await self._command_prompt_future
-        self._command_prompt_future = asyncio.get_running_loop().create_future()
+        output, prompt = await command_prompt_future
+        if self._command_prompt_future is command_prompt_future:
+            self._command_prompt_future = asyncio.get_running_loop().create_future()
         self._last_activity = time.monotonic()
         raise InteractiveInputRequiredError(prompt=prompt, partial_output=output)
 

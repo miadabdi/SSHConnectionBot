@@ -287,6 +287,8 @@ class SessionHandler:
                         )
                     await flush_stream()
                 except Exception as exc:
+                    if str(exc).strip() == "Command interrupted":
+                        return
                     await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
                     return
 
