@@ -86,37 +86,58 @@ class SessionHandler:
     def _build_stream_callbacks(
         self,
         chat_id: int,
-    ) -> tuple[StreamChunkCallback, Callable[[], Awaitable[None]], Callable[[], str]]:
-        stream_id = self.stream.generate_stream_id()
-        buffer = ""
-        lock = asyncio.Lock()
-        last_publish = 0.0
+        shell_state: dict,
+    ) -> tuple[
+        StreamChunkCallback,
+        Callable[[], Awaitable[None]],
+        Callable[[], tuple[str, bool]],
+        Callable[[], Awaitable[None]],
+    ]:
+        stream_ctx = {
+            "stream_id": self.stream.generate_stream_id(),
+            "buffer": "",
+            "lock": asyncio.Lock(),
+            "last_publish": 0.0,
+            "has_streamed": False,
+        }
+        shell_state["stream_ctx"] = stream_ctx
 
         async def publish(force: bool = False) -> None:
-            nonlocal last_publish
-            if not buffer.strip():
+            if not stream_ctx["buffer"].strip():
                 return
             now = time.monotonic()
-            if not force and now - last_publish < self.stream_update_interval:
+            if not force and now - stream_ctx["last_publish"] < self.stream_update_interval:
                 return
-            last_publish = now
-            rendered = Formatter.format_bash(Formatter.truncate(buffer))
-            await self.stream.publish(chat_id=chat_id, stream_id=stream_id, text=rendered, parse_mode="HTML")
+            stream_ctx["last_publish"] = now
+            rendered = Formatter.format_bash(Formatter.truncate(stream_ctx["buffer"]))
+            await self.stream.publish(
+                chat_id=chat_id,
+                stream_id=stream_ctx["stream_id"],
+                text=rendered,
+                parse_mode="HTML",
+            )
 
         async def on_stream(chunk: str) -> None:
-            nonlocal buffer
-            async with lock:
-                buffer += chunk
+            async with stream_ctx["lock"]:
+                if chunk:
+                    stream_ctx["buffer"] += chunk
+                    stream_ctx["has_streamed"] = True
                 await publish(force=False)
 
         async def flush() -> None:
-            async with lock:
+            async with stream_ctx["lock"]:
                 await publish(force=True)
 
-        def get_buffer() -> str:
-            return buffer
+        def get_stream_meta() -> tuple[str, bool]:
+            return stream_ctx["buffer"], bool(stream_ctx["has_streamed"])
 
-        return on_stream, flush, get_buffer
+        async def rotate_stream() -> None:
+            async with stream_ctx["lock"]:
+                stream_ctx["stream_id"] = self.stream.generate_stream_id()
+                stream_ctx["buffer"] = ""
+                stream_ctx["last_publish"] = 0.0
+
+        return on_stream, flush, get_stream_meta, rotate_stream
 
     async def _send_output(self, message: Message, output: str, exit_code: int | None) -> None:
         formatted = Formatter.format_bash(output)
@@ -266,6 +287,9 @@ class SessionHandler:
                 except Exception as exc:
                     await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
                     return
+                rotate_stream = shell_state.get("rotate_stream")
+                if rotate_stream:
+                    await rotate_stream()
                 return
 
             async with shell_lock:
@@ -276,7 +300,11 @@ class SessionHandler:
                     )
                     return
 
-                on_stream, flush_stream, get_stream_buffer = self._build_stream_callbacks(chat_id=message.chat.id)
+                on_stream, flush_stream, get_stream_meta, rotate_stream = self._build_stream_callbacks(
+                    chat_id=message.chat.id,
+                    shell_state=shell_state,
+                )
+                shell_state["rotate_stream"] = rotate_stream
                 try:
                     result = await self.service.shell_execute(
                         user_id=user_id,
@@ -289,9 +317,12 @@ class SessionHandler:
                         return
                     await message.answer(f"❌ Shell error: {Formatter.escape_html(str(exc))}")
                     return
+                finally:
+                    shell_state.pop("rotate_stream", None)
+                    shell_state.pop("stream_ctx", None)
 
-                streamed_output = get_stream_buffer()
-                if result.output.strip() and not streamed_output.strip():
+                _, has_streamed = get_stream_meta()
+                if result.output.strip() and not has_streamed:
                     await self._send_output(message=message, output=result.output, exit_code=result.exit_code)
                 if not result.output.strip():
                     status = "✅" if result.exit_code == 0 else f"⚠️ Exit code: <code>{result.exit_code}</code>"

@@ -67,6 +67,23 @@ class _FakeCommandService:
         self.interrupt_calls += 1
 
 
+class _BlockingCommandService(_FakeCommandService):
+    def __init__(self, session: _FakeSession) -> None:
+        super().__init__(session)
+        self.started = asyncio.Event()
+        self.resume = asyncio.Event()
+
+    async def shell_execute(self, user_id: int, command: str, on_stream_chunk=None) -> ShellCommandResult:
+        self.shell_commands.append(command)
+        self.started.set()
+        if on_stream_chunk:
+            await on_stream_chunk("phase1")
+        await self.resume.wait()
+        if on_stream_chunk:
+            await on_stream_chunk("phase2")
+        return ShellCommandResult(output="phase1phase2", exit_code=0, cwd="/srv/app")
+
+
 class _FakeMessage:
     def __init__(self, text: str, user_id: int = 10, chat_id: int = 99) -> None:
         self.text = text
@@ -228,3 +245,32 @@ async def test_handle_message_forwards_input_when_command_is_running() -> None:
 
     assert service.shell_inputs == ["1"]
     assert message.answers == []
+
+
+@pytest.mark.asyncio
+async def test_running_command_rotates_stream_after_user_input() -> None:
+    service = _BlockingCommandService(_FakeSession(is_interactive=True))
+    stream = _FakeStreamPublisher()
+    handler = SessionHandler(
+        service=service,
+        stream_publisher=stream,
+        stream_update_interval=0.0,
+    )
+
+    first = _FakeMessage("long-task", user_id=10)
+    first_task = asyncio.create_task(handler.handle_message(first))
+    await service.started.wait()
+
+    second = _FakeMessage("user-input", user_id=10)
+    await handler.handle_message(second)
+    assert service.shell_inputs == ["user-input"]
+
+    service.resume.set()
+    await first_task
+
+    phase1_streams = {stream_id for _, stream_id, text, _ in stream.published if "phase1" in text}
+    phase2_streams = {stream_id for _, stream_id, text, _ in stream.published if "phase2" in text}
+
+    assert len(phase1_streams) == 1
+    assert len(phase2_streams) == 1
+    assert phase1_streams != phase2_streams
